@@ -12,7 +12,10 @@ import SwiftData
 struct StackDexApp: App {
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
-            Item.self,
+            AppStateEntity.self,
+            CollectionEntity.self,
+            CardStackEntity.self,
+            ConditionBucketEntity.self,
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 
