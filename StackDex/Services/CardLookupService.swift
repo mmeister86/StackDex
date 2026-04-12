@@ -1,5 +1,40 @@
 import Foundation
 
+struct AppConfiguration {
+    static let defaultConvexURLString = "https://backend.stackdex.de"
+    static let defaultConvexLookupPath = "cards:lookup"
+
+    static let convexURLInfoKey = "STACKDEX_CONVEX_URL"
+    static let convexLookupPathInfoKey = "STACKDEX_CONVEX_LOOKUP_PATH"
+
+    let convexBaseURL: URL
+    let convexLookupPath: String
+
+    init(bundle: Bundle = .main) {
+        let rawURL = bundle.stringValue(forInfoDictionaryKey: Self.convexURLInfoKey)
+            ?? Self.defaultConvexURLString
+        let resolvedURL = URL(string: rawURL.trimmingCharacters(in: .whitespacesAndNewlines))
+            ?? URL(string: Self.defaultConvexURLString)
+            ?? URL(string: "https://backend.stackdex.de")!
+
+        let rawLookupPath = bundle.stringValue(forInfoDictionaryKey: Self.convexLookupPathInfoKey)
+            ?? Self.defaultConvexLookupPath
+        let resolvedLookupPath = rawLookupPath.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        self.convexBaseURL = resolvedURL
+        self.convexLookupPath = resolvedLookupPath.isEmpty ? Self.defaultConvexLookupPath : resolvedLookupPath
+    }
+}
+
+private extension Bundle {
+    func stringValue(forInfoDictionaryKey key: String) -> String? {
+        guard let value = object(forInfoDictionaryKey: key) else {
+            return nil
+        }
+        return value as? String
+    }
+}
+
 struct CardLookupRequest {
     let recognizedTexts: [String]
     let hints: ScanLookupHints?
@@ -74,5 +109,283 @@ struct MockCardLookupService: CardLookupServing {
             source.contains(candidate.identity.name.lowercased().split(separator: " ").first ?? "") || candidate.confidence >= 0.6
         }
         return Array(positiveMatches.prefix(request.maxResults))
+    }
+}
+
+struct ConvexPreferredCardLookupService: CardLookupServing {
+    let primary: ConvexCardLookupService
+    let fallback: any CardLookupServing
+
+    init(primary: ConvexCardLookupService, fallback: any CardLookupServing = MockCardLookupService()) {
+        self.primary = primary
+        self.fallback = fallback
+    }
+
+    func lookupCandidates(for request: CardLookupRequest) async -> [CardLookupCandidate] {
+        do {
+            return try await primary.lookupCandidatesThrowing(for: request)
+        } catch {
+            return await fallback.lookupCandidates(for: request)
+        }
+    }
+}
+
+enum CardLookupServiceFactory {
+    static func makeDefault(bundle: Bundle = .main) -> any CardLookupServing {
+        let config = AppConfiguration(bundle: bundle)
+        let primary = ConvexCardLookupService(
+            baseURL: config.convexBaseURL,
+            lookupPath: config.convexLookupPath
+        )
+        return ConvexPreferredCardLookupService(primary: primary)
+    }
+}
+
+struct ConvexCardLookupService: CardLookupServing {
+    let baseURL: URL
+    let lookupPath: String
+    let session: URLSession
+
+    init(baseURL: URL, lookupPath: String, session: URLSession = .shared) {
+        self.baseURL = baseURL
+        self.lookupPath = lookupPath
+        self.session = session
+    }
+
+    func lookupCandidates(for request: CardLookupRequest) async -> [CardLookupCandidate] {
+        (try? await lookupCandidatesThrowing(for: request)) ?? []
+    }
+
+    func lookupCandidatesThrowing(for request: CardLookupRequest) async throws -> [CardLookupCandidate] {
+        let endpoint = baseURL
+            .appendingPathComponent("api")
+            .appendingPathComponent("query")
+
+        var urlRequest = URLRequest(url: endpoint)
+        urlRequest.httpMethod = "POST"
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        urlRequest.httpBody = try JSONSerialization.data(withJSONObject: convexRequestBody(for: request))
+
+        let (data, response) = try await session.data(for: urlRequest)
+        guard let httpResponse = response as? HTTPURLResponse, 200 ..< 300 ~= httpResponse.statusCode else {
+            throw ConvexLookupError.invalidHTTPResponse
+        }
+
+        let parsedObject = try JSONSerialization.jsonObject(with: data)
+        let payload = Self.resolvedPayloadRoot(from: parsedObject)
+        let candidates = Self.extractCandidatePayloads(from: payload)
+            .compactMap(Self.mapCandidate(from:))
+            .sorted(by: { $0.confidence > $1.confidence })
+
+        guard !candidates.isEmpty else {
+            throw ConvexLookupError.emptyResult
+        }
+
+        return Array(candidates.prefix(request.maxResults))
+    }
+
+    private func convexRequestBody(for request: CardLookupRequest) -> [String: Any] {
+        var args: [String: Any] = [
+            "recognizedTexts": request.recognizedTexts,
+            "query": request.hints?.normalizedQuery ?? request.recognizedTexts.joined(separator: " "),
+            "maxResults": request.maxResults,
+        ]
+
+        if let hints = request.hints {
+            args["hints"] = [
+                "normalizedQuery": hints.normalizedQuery,
+                "nameTokens": hints.nameTokens,
+                "possibleNumbers": hints.possibleNumbers,
+            ]
+        }
+
+        return [
+            "path": lookupPath,
+            "args": args,
+            "format": "json",
+        ]
+    }
+}
+
+extension ConvexCardLookupService {
+    enum ConvexLookupError: Error {
+        case invalidHTTPResponse
+        case emptyResult
+    }
+
+    static func resolvedPayloadRoot(from parsedObject: Any) -> Any {
+        guard let root = parsedObject as? [String: Any] else {
+            return parsedObject
+        }
+
+        for key in ["value", "result", "data", "payload"] {
+            if let value = root[key] {
+                return value
+            }
+        }
+
+        return root
+    }
+
+    static func extractCandidatePayloads(from payload: Any) -> [[String: Any]] {
+        if let direct = payload as? [[String: Any]] {
+            return direct
+        }
+
+        if let object = payload as? [String: Any] {
+            for key in ["results", "candidates", "items", "cards", "matches", "entries"] {
+                if let nested = object[key] {
+                    let extracted = extractCandidatePayloads(from: nested)
+                    if !extracted.isEmpty {
+                        return extracted
+                    }
+                }
+            }
+
+            if firstString(in: object, keys: ["name", "cardName", "title"]) != nil {
+                return [object]
+            }
+        }
+
+        if let array = payload as? [Any] {
+            return array.compactMap { $0 as? [String: Any] }
+        }
+
+        return []
+    }
+
+    static func mapCandidate(from payload: [String: Any]) -> CardLookupCandidate? {
+        guard let name = firstString(in: payload, keys: ["name", "cardName", "title"])?.trimmedNonEmpty else {
+            return nil
+        }
+
+        let setName = firstString(in: payload, keys: ["setName", "set", "set_name", "series", "expansion"])
+        let cardNumber = firstString(in: payload, keys: ["cardNumber", "collectorNumber", "number", "no", "setNumber"])
+
+        let canonicalCardID = firstString(
+            in: payload,
+            keys: ["canonicalCardID", "canonicalCardId", "cardID", "cardId", "id", "_id"]
+        ) ?? synthesizedCanonicalID(name: name, setName: setName, cardNumber: cardNumber)
+
+        let imageURLString = firstString(
+            in: payload,
+            keys: ["imageURLString", "imageUrl", "imageURL", "image", "images.small", "images.large"]
+        )
+
+        let generalPrice = decimal(
+            from: firstValue(in: payload, keys: ["generalPrice", "price", "marketPrice", "prices.market"])
+        )
+
+        let confidence = min(
+            max(double(from: firstValue(in: payload, keys: ["confidence", "score", "relevance", "matchScore"])) ?? 0.5, 0),
+            1
+        )
+
+        return CardLookupCandidate(
+            identity: CardIdentity(
+                canonicalCardID: canonicalCardID,
+                name: name,
+                setName: setName,
+                cardNumber: cardNumber
+            ),
+            imageURLString: imageURLString,
+            generalPrice: generalPrice,
+            confidence: confidence
+        )
+    }
+
+    static func firstValue(in object: [String: Any], keys: [String]) -> Any? {
+        for key in keys {
+            if key.contains(".") {
+                let parts = key.split(separator: ".").map(String.init)
+                if let nested = value(in: object, path: parts) {
+                    return nested
+                }
+            } else if let value = object[key] {
+                return value
+            }
+        }
+        return nil
+    }
+
+    static func value(in object: [String: Any], path: [String]) -> Any? {
+        guard let first = path.first else {
+            return object
+        }
+
+        guard let currentValue = object[first] else {
+            return nil
+        }
+
+        if path.count == 1 {
+            return currentValue
+        }
+
+        guard let nestedObject = currentValue as? [String: Any] else {
+            return nil
+        }
+
+        return value(in: nestedObject, path: Array(path.dropFirst()))
+    }
+
+    static func firstString(in object: [String: Any], keys: [String]) -> String? {
+        guard let value = firstValue(in: object, keys: keys) else {
+            return nil
+        }
+
+        if let direct = value as? String {
+            return direct
+        }
+        if let number = value as? NSNumber {
+            return number.stringValue
+        }
+        if let dictionary = value as? [String: Any], let nested = dictionary["name"] as? String {
+            return nested
+        }
+
+        return nil
+    }
+
+    static func double(from value: Any?) -> Double? {
+        if let number = value as? NSNumber {
+            return number.doubleValue
+        }
+        if let string = value as? String {
+            return Double(string.replacingOccurrences(of: ",", with: "."))
+        }
+        return nil
+    }
+
+    static func decimal(from value: Any?) -> Decimal? {
+        if let number = value as? NSNumber {
+            return number.decimalValue
+        }
+        if let string = value as? String {
+            return Decimal(
+                string: string.replacingOccurrences(of: ",", with: "."),
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+        }
+        return nil
+    }
+
+    static func synthesizedCanonicalID(name: String, setName: String?, cardNumber: String?) -> String {
+        let nameToken = slug(from: name)
+        let setToken = slug(from: setName ?? "unknown")
+        let numberToken = slug(from: cardNumber ?? "na")
+        return "\(setToken)-\(numberToken)-\(nameToken)"
+    }
+
+    static func slug(from value: String) -> String {
+        let lowered = value.lowercased()
+        let replaced = lowered.replacingOccurrences(of: "[^a-z0-9]+", with: "-", options: .regularExpression)
+        return replaced.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    }
+}
+
+private extension String {
+    var trimmedNonEmpty: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

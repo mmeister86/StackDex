@@ -23,8 +23,16 @@ struct ScanTabView: View {
     @State private var infoMessage: String?
     @State private var errorMessage: String?
 
-    private let lookupService: any CardLookupServing = MockCardLookupService()
-    private let scanPipeline: any ScanPipelineServing = VisionScanPipelineService()
+    private let lookupService: any CardLookupServing
+    private let scanPipeline: any ScanPipelineServing
+
+    init(
+        lookupService: any CardLookupServing = CardLookupServiceFactory.makeDefault(),
+        scanPipeline: any ScanPipelineServing = VisionScanPipelineService()
+    ) {
+        self.lookupService = lookupService
+        self.scanPipeline = scanPipeline
+    }
 
     var body: some View {
         NavigationStack {
