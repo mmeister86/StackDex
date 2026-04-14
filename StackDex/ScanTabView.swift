@@ -245,6 +245,7 @@ struct ScanTabView: View {
                 Text(infoMessage)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("scan.info.message")
             }
 
             if let errorMessage {
@@ -261,6 +262,8 @@ struct ScanTabView: View {
                 CandidateRowView(
                     title: candidate.identity.name,
                     subtitle: detailLine(for: candidate.identity),
+                    valueHint: valueHint(for: candidate),
+                    imageURLString: candidate.imageURLString,
                     isSelected: selectedCandidateID == candidate.id
                 ) {
                     selectedCandidateID = candidate.id
@@ -285,12 +288,14 @@ struct ScanTabView: View {
                     Text(collection.name).tag(Optional(collection.id))
                 }
             }
+            .accessibilityIdentifier("scan.save.targetCollection")
 
             Toggle("Als separaten Stapel speichern", isOn: $separateStack)
 
             Button("In Sammlung speichern") {
                 saveSelection()
             }
+            .accessibilityIdentifier("scan.save.submit")
             .buttonStyle(.borderedProminent)
             .disabled(selectedCandidate == nil || selectedTargetCollectionID == nil || quantity < 1)
         }
@@ -303,12 +308,14 @@ struct ScanTabView: View {
 
             TextField("Name, Set oder Nummer", text: $manualSearchQuery)
                 .textFieldStyle(.roundedBorder)
+                .accessibilityIdentifier("scan.manual.query")
 
             Button("Suche starten") {
                 Task {
                     await performManualLookup()
                 }
             }
+            .accessibilityIdentifier("scan.manual.submit")
             .buttonStyle(.bordered)
             .disabled(manualSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isProcessing)
         }
@@ -451,7 +458,7 @@ struct ScanTabView: View {
                 return
             }
             update(stack: stack, using: candidate)
-            addQuantity(to: stack)
+            addQuantity(to: stack, using: candidate)
             infoMessage = "Zur vorhandenen Karte hinzugefuegt."
         case .createNewStack:
             let stack = CardStackEntity(
@@ -468,7 +475,7 @@ struct ScanTabView: View {
 
             modelContext.insert(stack)
             targetCollection.cardStacks.append(stack)
-            addQuantity(to: stack)
+            addQuantity(to: stack, using: candidate)
             infoMessage = "Neue Karte in der Sammlung gespeichert."
         }
 
@@ -489,21 +496,28 @@ struct ScanTabView: View {
         }
     }
 
-    private func addQuantity(to stack: CardStackEntity) {
+    private func addQuantity(to stack: CardStackEntity, using candidate: CardLookupCandidate) {
         let resolvedCondition = selectedCondition ?? .nearMint
+        let pricing = ScanPricingPolicy.resolve(candidate: candidate, selectedCondition: selectedCondition)
 
         if let existingBucket = stack.conditionBuckets.first(where: { $0.condition == resolvedCondition }) {
             existingBucket.quantity += quantity
-            if selectedCondition == nil {
-                existingBucket.isApproximatePrice = true
-            }
+
+            let existingResolution = ScanPricingPolicy.Resolution(
+                conditionPrice: existingBucket.conditionPrice,
+                isApproximatePrice: existingBucket.isApproximatePrice
+            )
+            let mergedResolution = ScanPricingPolicy.merge(existing: existingResolution, incoming: pricing)
+            existingBucket.conditionPrice = mergedResolution.conditionPrice
+            existingBucket.isApproximatePrice = mergedResolution.isApproximatePrice
             return
         }
 
         let bucket = ConditionBucketEntity(
             condition: resolvedCondition,
             quantity: quantity,
-            isApproximatePrice: selectedCondition == nil,
+            conditionPrice: pricing.conditionPrice,
+            isApproximatePrice: pricing.isApproximatePrice,
             cardStack: stack
         )
         stack.conditionBuckets.append(bucket)
@@ -572,17 +586,40 @@ struct ScanTabView: View {
         case .damaged: return "Damaged"
         }
     }
+
+    private func valueHint(for candidate: CardLookupCandidate) -> String? {
+        if let generalPrice = candidate.generalPrice {
+            return "Marktwert: \(currencyString(from: generalPrice))"
+        }
+
+        if let fallback = candidate.conditionPrices.values.max() {
+            return "Ca. \(currencyString(from: fallback))"
+        }
+
+        return nil
+    }
+
+    private func currencyString(from decimal: Decimal) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .currency
+        formatter.locale = .autoupdatingCurrent
+        return formatter.string(from: decimal as NSDecimalNumber) ?? "-"
+    }
 }
 
 private struct CandidateRowView: View {
     let title: String
     let subtitle: String
+    let valueHint: String?
+    let imageURLString: String?
     let isSelected: Bool
     var onTap: () -> Void
 
     var body: some View {
         Button(action: onTap) {
             HStack(spacing: 10) {
+                CandidateThumbnailView(imageURLString: imageURLString)
+
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .foregroundStyle(isSelected ? Color.accentColor : Color.secondary)
 
@@ -592,6 +629,12 @@ private struct CandidateRowView: View {
                     Text(subtitle)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    if let valueHint {
+                        Text(valueHint)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 Spacer()
             }
@@ -602,6 +645,38 @@ private struct CandidateRowView: View {
             )
         }
         .buttonStyle(.plain)
+        .accessibilityIdentifier("scan.candidate.\(title)")
+    }
+}
+
+private struct CandidateThumbnailView: View {
+    let imageURLString: String?
+
+    var body: some View {
+        Group {
+            if let imageURLString, let url = URL(string: imageURLString) {
+                AsyncImage(url: url) { image in
+                    image
+                        .resizable()
+                        .scaledToFill()
+                } placeholder: {
+                    placeholder
+                }
+            } else {
+                placeholder
+            }
+        }
+        .frame(width: 40, height: 56)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var placeholder: some View {
+        RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .fill(.secondary.opacity(0.12))
+            .overlay {
+                Image(systemName: "photo")
+                    .foregroundStyle(.secondary)
+            }
     }
 }
 

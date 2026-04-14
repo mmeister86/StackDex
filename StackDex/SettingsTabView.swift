@@ -67,11 +67,14 @@ struct SettingsTabView: View {
     private var createCollectionSection: some View {
         Section("Sammlung erstellen") {
             TextField("Name", text: $newCollectionName)
+                .accessibilityIdentifier("settings.create.name")
             TextField("Beschreibung (optional)", text: $newCollectionDescription)
+                .accessibilityIdentifier("settings.create.description")
 
             Button("Erstellen") {
                 createCollection()
             }
+            .accessibilityIdentifier("settings.create.submit")
             .disabled(newCollectionName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
     }
@@ -84,6 +87,7 @@ struct SettingsTabView: View {
                     Text(collection.name).tag(Optional(collection.id))
                 }
             }
+            .accessibilityIdentifier("settings.pinned.picker")
             .onChange(of: pinnedCollectionID) { _, newValue in
                 AppStateAccess.setPinnedCollectionID(newValue, in: modelContext)
             }
@@ -127,6 +131,7 @@ struct SettingsTabView: View {
                                 collection.lastUsedAt = .now
                                 try? modelContext.save()
                             }
+                            .accessibilityIdentifier("settings.collection.setActive")
 
                             Button("Umbenennen") {
                                 collectionToRename = collection
@@ -141,6 +146,7 @@ struct SettingsTabView: View {
                             Image(systemName: "ellipsis.circle")
                                 .font(.title3)
                         }
+                        .accessibilityLabel("Aktionen \(collection.name)")
                     }
                 }
             }

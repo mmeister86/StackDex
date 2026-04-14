@@ -404,6 +404,7 @@
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Fotos werden fuer den Karten-Scan verwendet.";
 				INFOPLIST_KEY_PHPhotoLibraryPreventAutomaticLimitedAccessAlert = YES;
 				INFOPLIST_KEY_STACKDEX_CONVEX_LOOKUP_PATH = "cards:lookup";
+				INFOPLIST_KEY_STACKDEX_CONVEX_LOOKUP_SCHEMA_VERSION = "cards.lookup.v1";
 				INFOPLIST_KEY_STACKDEX_CONVEX_URL = "https://backend.stackdex.de";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -446,6 +447,7 @@
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "Fotos werden fuer den Karten-Scan verwendet.";
 				INFOPLIST_KEY_PHPhotoLibraryPreventAutomaticLimitedAccessAlert = YES;
 				INFOPLIST_KEY_STACKDEX_CONVEX_LOOKUP_PATH = "cards:lookup";
+				INFOPLIST_KEY_STACKDEX_CONVEX_LOOKUP_SCHEMA_VERSION = "cards.lookup.v1";
 				INFOPLIST_KEY_STACKDEX_CONVEX_URL = "https://backend.stackdex.de";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;

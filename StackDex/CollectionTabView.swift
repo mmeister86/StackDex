@@ -45,6 +45,7 @@ struct CollectionTabView: View {
                         Label(switcherTitle, systemImage: "chevron.up.chevron.down")
                             .labelStyle(.titleAndIcon)
                     }
+                    .accessibilityIdentifier("collection.scope.switcher")
                 }
             }
             .searchable(text: $searchText, prompt: "Karten suchen")
@@ -176,13 +177,7 @@ private struct CollectionStackRowView: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            RoundedRectangle(cornerRadius: 8)
-                .fill(.secondary.opacity(0.12))
-                .frame(width: 44, height: 60)
-                .overlay {
-                    Image(systemName: "photo")
-                        .foregroundStyle(.secondary)
-                }
+            stackPreview
 
             VStack(alignment: .leading, spacing: 4) {
                 Text(stack.cardName)
@@ -202,6 +197,35 @@ private struct CollectionStackRowView: View {
                 .foregroundStyle(.secondary)
         }
         .padding(.vertical, 2)
+        .accessibilityIdentifier("collection.stack.\(stack.canonicalCardID)")
+    }
+
+    @ViewBuilder
+    private var stackPreview: some View {
+        if let imageURLString = stack.imageURLString,
+           let url = URL(string: imageURLString) {
+            AsyncImage(url: url) { image in
+                image
+                    .resizable()
+                    .scaledToFill()
+            } placeholder: {
+                placeholderPreview
+            }
+            .frame(width: 44, height: 60)
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        } else {
+            placeholderPreview
+                .frame(width: 44, height: 60)
+        }
+    }
+
+    private var placeholderPreview: some View {
+        RoundedRectangle(cornerRadius: 8)
+            .fill(.secondary.opacity(0.12))
+            .overlay {
+                Image(systemName: "photo")
+                    .foregroundStyle(.secondary)
+            }
     }
 
     private var secondaryLine: String {
