@@ -390,6 +390,34 @@ struct ConvexCardLookupServiceTests {
         #expect(responseSchemaVersion == "cards.lookup.v2")
     }
 
+    @Test func requestBodyPrefersExplicitQueryOverrideWhileKeepingHintsAndRecognizedTexts() throws {
+        let service = ConvexCardLookupService(
+            baseURL: URL(string: "https://backend.stackdex.de")!,
+            lookupPath: "cards:lookup"
+        )
+
+        let request = CardLookupRequest(
+            recognizedTexts: ["Pikachu ex", "199/091", "Thunderbolt charge"],
+            query: "Pikachu ex",
+            hints: ScanLookupHints(
+                normalizedQuery: "Pikachu ex 199/091",
+                nameTokens: ["Pikachu", "ex"],
+                possibleNumbers: ["199/091"]
+            ),
+            maxResults: 3
+        )
+
+        let body = service.convexRequestBody(for: request)
+        let args = try #require(body["args"] as? [String: Any])
+        let query = try #require(args["query"] as? String)
+        let recognizedTexts = try #require(args["recognizedTexts"] as? [String])
+        let hints = try #require(args["hints"] as? [String: Any])
+
+        #expect(query == "Pikachu ex")
+        #expect(recognizedTexts == ["Pikachu ex", "199/091", "Thunderbolt charge"])
+        #expect(hints["normalizedQuery"] as? String == "Pikachu ex 199/091")
+    }
+
     @Test func lookupCallsConvexActionTransportEndpoint() async throws {
         MockURLProtocol.requestHandler = { request in
             #expect(request.url?.absoluteString == "https://backend.stackdex.de/api/action")
@@ -473,6 +501,98 @@ struct ConvexCardLookupServiceTests {
         #expect(candidates == [])
     }
 
+    @Test func progressiveScanLookupRetriesEmptySuccessWithNarrowerQueries() async {
+        let service = RecordingLookupService(
+            responses: [
+                "Pikachu ex 199/091": [],
+                "Pikachu ex": [
+                    CardLookupCandidate(
+                        identity: CardIdentity(canonicalCardID: "sv2-199", name: "Pikachu ex", setName: "Paldea Evolved", cardNumber: "199/091"),
+                        confidence: 0.92
+                    )
+                ],
+            ]
+        )
+        let progressive = ProgressiveScanLookupService(base: service)
+
+        let result = await progressive.lookupScanCandidates(
+            for: CardLookupRequest(
+                recognizedTexts: ["Pikachu ex", "199/091", "Thunderbolt charge"],
+                hints: ScanLookupHints(
+                    normalizedQuery: "Pikachu ex 199/091",
+                    nameTokens: ["Pikachu", "ex"],
+                    possibleNumbers: ["199/091"]
+                ),
+                maxResults: 3
+            )
+        )
+
+        let recordedQueries = await service.recordedQueries
+
+        #expect(recordedQueries == ["Pikachu ex 199/091", "Pikachu ex"])
+        #expect(result.candidates.count == 1)
+        #expect(result.attempts.count == 2)
+        #expect(result.attempts.map(\.query) == ["Pikachu ex 199/091", "Pikachu ex"])
+    }
+
+    @Test func progressiveScanLookupFallsBackToRankedOCRTokensWhenStructuredQueriesMiss() async {
+        let service = RecordingLookupService(
+            responses: [
+                "Pikachu ex 199/091": [],
+                "Pikachu ex": [],
+                "Pikachu ex 199/091 Thunderbolt charge": [
+                    CardLookupCandidate(
+                        identity: CardIdentity(canonicalCardID: "sv2-199", name: "Pikachu ex", setName: "Paldea Evolved", cardNumber: "199/091"),
+                        confidence: 0.88
+                    )
+                ],
+            ]
+        )
+        let progressive = ProgressiveScanLookupService(base: service)
+
+        let result = await progressive.lookupScanCandidates(
+            for: CardLookupRequest(
+                recognizedTexts: ["Pikachu ex", "199/091", "Thunderbolt charge"],
+                hints: ScanLookupHints(
+                    normalizedQuery: "Pikachu ex 199/091",
+                    nameTokens: ["Pikachu", "ex"],
+                    possibleNumbers: ["199/091"]
+                ),
+                maxResults: 3
+            )
+        )
+
+        let recordedQueries = await service.recordedQueries
+
+        #expect(recordedQueries == ["Pikachu ex 199/091", "Pikachu ex", "Pikachu ex 199/091 Thunderbolt charge"])
+        #expect(result.candidates.count == 1)
+        #expect(result.attempts.count == 3)
+    }
+
+    @Test func progressiveScanLookupAvoidsDuplicateAttemptsAndStaysBounded() async {
+        let service = RecordingLookupService(responses: [:])
+        let progressive = ProgressiveScanLookupService(base: service)
+
+        let result = await progressive.lookupScanCandidates(
+            for: CardLookupRequest(
+                recognizedTexts: ["Pikachu ex", "Pikachu ex", "199/091"],
+                hints: ScanLookupHints(
+                    normalizedQuery: "Pikachu ex",
+                    nameTokens: ["Pikachu", "ex"],
+                    possibleNumbers: []
+                ),
+                maxResults: 3
+            )
+        )
+
+        let recordedQueries = await service.recordedQueries
+
+        #expect(recordedQueries.first == "Pikachu ex")
+        #expect(Set(recordedQueries).count == recordedQueries.count)
+        #expect(recordedQueries.count <= 3)
+        #expect(result.candidates.isEmpty)
+    }
+
     private func makeSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [MockURLProtocol.self]
@@ -485,6 +605,21 @@ private struct StubLookupService: CardLookupServing {
 
     func lookupCandidates(for request: CardLookupRequest) async -> [CardLookupCandidate] {
         Array(candidates.prefix(request.maxResults))
+    }
+}
+
+private actor RecordingLookupService: CardLookupServing {
+    private(set) var recordedQueries: [String] = []
+    let responses: [String: [CardLookupCandidate]]
+
+    init(responses: [String: [CardLookupCandidate]]) {
+        self.responses = responses
+    }
+
+    func lookupCandidates(for request: CardLookupRequest) async -> [CardLookupCandidate] {
+        let query = request.query ?? request.hints?.normalizedQuery ?? request.recognizedTexts.joined(separator: " ")
+        recordedQueries.append(query)
+        return Array((responses[query] ?? []).prefix(request.maxResults))
     }
 }
 

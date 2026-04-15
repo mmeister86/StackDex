@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 struct AppConfiguration {
     static let defaultConvexURLString = "https://backend.stackdex.de"
@@ -47,13 +48,38 @@ private extension Bundle {
 
 struct CardLookupRequest {
     let recognizedTexts: [String]
+    let query: String?
     let hints: ScanLookupHints?
     let maxResults: Int
 
-    init(recognizedTexts: [String], hints: ScanLookupHints? = nil, maxResults: Int = 3) {
+    init(recognizedTexts: [String], query: String? = nil, hints: ScanLookupHints? = nil, maxResults: Int = 3) {
         self.recognizedTexts = recognizedTexts
+        self.query = query
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .flatMap { $0.nilIfEmpty }
         self.hints = hints
         self.maxResults = max(1, maxResults)
+    }
+}
+
+struct ScanLookupAttempt: Equatable, Sendable {
+    enum Strategy: String, Equatable, Sendable {
+        case structuredNameAndNumber
+        case structuredNameOnly
+        case rankedOCRTokens
+    }
+
+    let strategy: Strategy
+    let query: String
+    let candidateCount: Int
+}
+
+struct ScanLookupResponse: Equatable, Sendable {
+    let candidates: [CardLookupCandidate]
+    let attempts: [ScanLookupAttempt]
+
+    var selectedQuery: String? {
+        attempts.last?.query
     }
 }
 
@@ -64,6 +90,116 @@ protocol CardLookupServing {
 extension CardLookupServing {
     func lookupCandidates(from recognizedTexts: [String], maxResults: Int) async -> [CardLookupCandidate] {
         await lookupCandidates(for: CardLookupRequest(recognizedTexts: recognizedTexts, maxResults: maxResults))
+    }
+}
+
+protocol ScanLookupServing {
+    func lookupScanCandidates(for request: CardLookupRequest) async -> ScanLookupResponse
+}
+
+struct ProgressiveScanLookupService: ScanLookupServing {
+    private let logger = Logger(subsystem: "de.stackdex.app", category: "scan.lookup")
+    let base: any CardLookupServing
+
+    init(base: any CardLookupServing) {
+        self.base = base
+    }
+
+    func lookupScanCandidates(for request: CardLookupRequest) async -> ScanLookupResponse {
+        let plannedQueries = buildAttemptQueries(for: request)
+        var attempts: [ScanLookupAttempt] = []
+
+        for (strategy, query) in plannedQueries {
+            let response = await base.lookupCandidates(
+                for: CardLookupRequest(
+                    recognizedTexts: request.recognizedTexts,
+                    query: query,
+                    hints: request.hints,
+                    maxResults: request.maxResults
+                )
+            )
+
+            attempts.append(ScanLookupAttempt(strategy: strategy, query: query, candidateCount: response.count))
+            logger.info("Lookup attempt=\(attempts.count, privacy: .public) strategy=\(strategy.rawValue, privacy: .public) query=\(query, privacy: .public) candidates=\(response.count, privacy: .public)")
+
+            if !response.isEmpty {
+                return ScanLookupResponse(candidates: response, attempts: attempts)
+            }
+        }
+
+        logger.info("Lookup finished with no candidates after attempts=\(attempts.count, privacy: .public)")
+        return ScanLookupResponse(candidates: [], attempts: attempts)
+    }
+
+    private func buildAttemptQueries(for request: CardLookupRequest) -> [(ScanLookupAttempt.Strategy, String)] {
+        var orderedQueries: [(ScanLookupAttempt.Strategy, String)] = []
+        var seen: Set<String> = []
+
+        let trimmedName = request.hints
+            .map { $0.nameTokens.joined(separator: " ") }
+            .map { $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) }
+            .flatMap { $0.nilIfEmpty }
+        let trimmedNumber = request.hints?.possibleNumbers.first
+            .map { $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) }
+            .flatMap { $0.nilIfEmpty }
+        let structuredQuery = request.query ?? request.hints
+            .map { $0.normalizedQuery }
+            .flatMap { $0.nilIfEmpty }
+
+        let rankedTokens = request.recognizedTexts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let fallbackQuery = deduplicated(rankedTokens).prefix(4).joined(separator: " ").nilIfEmpty
+
+        if let structuredQuery {
+            appendQuery(structuredQuery, strategy: .structuredNameAndNumber, to: &orderedQueries, seen: &seen)
+        } else if let trimmedName, let trimmedNumber {
+            appendQuery("\(trimmedName) \(trimmedNumber)", strategy: .structuredNameAndNumber, to: &orderedQueries, seen: &seen)
+        }
+
+        if let trimmedName {
+            appendQuery(trimmedName, strategy: .structuredNameOnly, to: &orderedQueries, seen: &seen)
+        }
+
+        if let fallbackQuery {
+            appendQuery(fallbackQuery, strategy: .rankedOCRTokens, to: &orderedQueries, seen: &seen)
+        }
+
+        return Array(orderedQueries.prefix(3))
+    }
+
+    private func deduplicated(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        var deduplicatedValues: [String] = []
+
+        for value in values {
+            let normalized = value.lowercased()
+            guard seen.insert(normalized).inserted else {
+                continue
+            }
+            deduplicatedValues.append(value)
+        }
+
+        return deduplicatedValues
+    }
+
+    private func appendQuery(
+        _ query: String,
+        strategy: ScanLookupAttempt.Strategy,
+        to orderedQueries: inout [(ScanLookupAttempt.Strategy, String)],
+        seen: inout Set<String>
+    ) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return
+        }
+
+        let normalized = trimmed.lowercased()
+        guard seen.insert(normalized).inserted else {
+            return
+        }
+
+        orderedQueries.append((strategy, trimmed))
     }
 }
 
@@ -102,8 +238,9 @@ struct CardLookupCandidate: Identifiable, Hashable, Sendable {
 struct MockCardLookupService: CardLookupServing {
     func lookupCandidates(for request: CardLookupRequest) async -> [CardLookupCandidate] {
         let recognizedSource = request.recognizedTexts.joined(separator: " ").lowercased()
+        let explicitQuerySource = request.query?.lowercased() ?? ""
         let hintedSource = request.hints?.normalizedQuery.lowercased() ?? ""
-        let source = [recognizedSource, hintedSource]
+        let source = [recognizedSource, explicitQuerySource, hintedSource]
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -111,7 +248,7 @@ struct MockCardLookupService: CardLookupServing {
             .init(
                 identity: CardIdentity(canonicalCardID: "sv2-199", name: "Pikachu", setName: "Paldea Evolved", cardNumber: "199"),
                 generalPrice: Decimal(string: "14.5"),
-                confidence: source.contains("pikachu") ? 0.91 : 0.64
+                confidence: source.contains("pikachu") ? 0.91 : 0.54
             ),
             .init(
                 identity: CardIdentity(canonicalCardID: "sv3-151", name: "Charizard ex", setName: "151", cardNumber: "006"),
@@ -217,7 +354,7 @@ struct ConvexCardLookupService: CardLookupServing {
     func convexRequestBody(for request: CardLookupRequest) -> [String: Any] {
         var args: [String: Any] = [
             "recognizedTexts": request.recognizedTexts,
-            "query": request.hints?.normalizedQuery ?? request.recognizedTexts.joined(separator: " "),
+            "query": request.query ?? request.hints?.normalizedQuery ?? request.recognizedTexts.joined(separator: " "),
             "maxResults": request.maxResults,
             "responseSchemaVersion": responseSchemaVersion,
         ]
@@ -538,5 +675,9 @@ private extension String {
     var trimmedNonEmpty: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }

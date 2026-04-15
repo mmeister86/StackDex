@@ -1,4 +1,5 @@
 import AVFoundation
+import OSLog
 import Photos
 import SwiftData
 import SwiftUI
@@ -14,6 +15,7 @@ struct ScanTabView: View {
     @State private var isProcessing = false
     @State private var scanOutcome = ScanResultPolicy.Outcome(state: .noMatch, candidates: [])
     @State private var lastHints = ScanLookupHints(normalizedQuery: "", nameTokens: [], possibleNumbers: [])
+    @State private var lastPipelineResult: ScanPipelineResult?
     @State private var selectedCandidateID: String?
     @State private var quantity: Int = 1
     @State private var selectedCondition: CardCondition?
@@ -22,30 +24,50 @@ struct ScanTabView: View {
     @State private var manualSearchQuery = ""
     @State private var infoMessage: String?
     @State private var errorMessage: String?
+    @State private var isResultSheetPresented = false
+    @State private var selectedResultSheetDetent: PresentationDetent = .fraction(0.36)
+    @FocusState private var isManualSearchFocused: Bool
 
     private let lookupService: any CardLookupServing
+    private let scanLookupService: any ScanLookupServing
     private let scanPipeline: any ScanPipelineServing
+    private let logger = Logger(subsystem: "de.stackdex.app", category: "scan.ui")
 
     init(
         lookupService: any CardLookupServing = CardLookupServiceFactory.makeDefault(),
         scanPipeline: any ScanPipelineServing = VisionScanPipelineService()
     ) {
         self.lookupService = lookupService
+        self.scanLookupService = ProgressiveScanLookupService(base: lookupService)
         self.scanPipeline = scanPipeline
     }
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    cameraSection
-                    recentPhotosSection
-                    scanResultSection
-                    manualSearchSection
-                }
-                .padding(16)
+            VStack(spacing: 10) {
+                scannerShellSection
+                    .layoutPriority(1)
             }
+            .padding(.horizontal, 16)
+            .padding(.top, 12)
+            .padding(.bottom, 8)
+            .background(Color.black.ignoresSafeArea())
             .navigationTitle("Scannen")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        isResultSheetPresented = true
+                    } label: {
+                        Label("Suche", systemImage: "magnifyingglass")
+                    }
+                    .accessibilityIdentifier("scan.sheet.open")
+                }
+            }
+            .sheet(isPresented: $isResultSheetPresented) {
+                resultSheetContent
+                    .presentationDetents([.fraction(0.36), .medium, .large], selection: $selectedResultSheetDetent)
+                    .presentationDragIndicator(.visible)
+            }
             .onAppear {
                 prepareDefaultsIfNeeded()
                 camera.refreshAuthorizationStatus()
@@ -71,11 +93,24 @@ struct ScanTabView: View {
         }
     }
 
-    private var cameraSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Kamera")
-                .font(.headline)
+    private var scannerShellSection: some View {
+        ZStack {
+            scannerCanvas
+            scannerShellChrome
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(minHeight: 420)
+        .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 28, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("scan.shell.root")
+    }
 
+    private var scannerCanvas: some View {
+        ZStack {
             Group {
                 switch camera.authorizationStatus {
                 case .authorized:
@@ -83,7 +118,7 @@ struct ScanTabView: View {
                 case .notDetermined:
                     permissionCard(
                         title: "Kamerazugriff erforderlich",
-                        message: "Der Zugriff wird erst beim Start des Scans angefragt.",
+                        message: "Der Scanner bleibt bereit und fragt den Zugriff erst beim Aufnehmen an.",
                         primaryTitle: "Kamera erlauben"
                     ) {
                         Task {
@@ -110,135 +145,175 @@ struct ScanTabView: View {
                     }
                 }
             }
+
+            ScannerFocusOverlayView(
+                focusState: camera.focusIndicatorState,
+                isVisible: true
+            )
+
+            LinearGradient(
+                colors: [.clear, .black.opacity(0.14), .black.opacity(0.38)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .allowsHitTesting(false)
+        }
+        .background(
+            LinearGradient(
+                colors: [Color.accentColor.opacity(0.22), Color.black.opacity(0.88)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .accessibilityIdentifier("scan.shell.canvas")
+    }
+
+    private var scannerShellChrome: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Spacer()
+                recentPhotoShortcutButton
+            }
+            .padding(.top, 2)
+
+            if case let .interrupted(message) = camera.interruptionState {
+                interruptionBanner(message: message)
+                    .padding(.top, 10)
+            }
+
+            Spacer(minLength: 16)
+
+            scannerFrameOverlay
+
+            Spacer(minLength: 14)
+
+            Button(action: handleCaptureButtonTap) {
+                Label("Aufnehmen", systemImage: "camera.circle.fill")
+                    .font(.headline)
+                    .padding(.horizontal, 28)
+                    .padding(.vertical, 14)
+                    .frame(minWidth: 220)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.blue)
+            .foregroundStyle(.white)
+            .disabled(isProcessing || hasActiveScannerInterruption)
+            .accessibilityIdentifier("scan.shell.capture")
+        }
+        .padding(18)
+    }
+
+    private func interruptionBanner(message: String) -> some View {
+        HStack(alignment: .center, spacing: 10) {
+            Image(systemName: "camera.metering.unknown")
+                .font(.subheadline.weight(.semibold))
+
+            Text(message)
+                .font(.footnote.weight(.medium))
+                .multilineTextAlignment(.leading)
+
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .accessibilityIdentifier("scan.shell.interruption")
+    }
+
+    private var recentPhotoShortcutButton: some View {
+        Button(action: handleRecentPhotoShortcutTap) {
+            ZStack(alignment: .bottomTrailing) {
+                Group {
+                    if let latestItem = recentPhotos.latestItem {
+                        Image(uiImage: latestItem.thumbnail)
+                            .resizable()
+                            .scaledToFill()
+                    } else {
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(.black.opacity(0.28))
+                            .overlay {
+                                Image(systemName: "photo.on.rectangle.angled")
+                                    .font(.subheadline.weight(.semibold))
+                                    .foregroundStyle(.white)
+                            }
+                    }
+                }
+                .frame(width: 46, height: 46)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+                Image(systemName: "photo")
+                    .font(.system(size: 9, weight: .bold))
+                    .padding(5)
+                    .background(.ultraThinMaterial, in: Circle())
+                    .offset(x: 3, y: 3)
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Letztes Foto verwenden")
+        .accessibilityHint("Oeffnet das neueste Foto oder fragt Fotozugriff an")
+        .accessibilityIdentifier("scan.shell.recentPhotoShortcut")
+    }
+
+    private var scannerFrameOverlay: some View {
+        GeometryReader { proxy in
+            let width = min(proxy.size.width * 0.7, 270)
+            let height = width * 1.4
+
+            VStack(spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(.black.opacity(0.18))
+
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .strokeBorder(.white.opacity(0.92), style: StrokeStyle(lineWidth: 3, dash: [16, 10]))
+                }
+                .frame(width: width, height: height)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Scanner-Rahmen")
+                .accessibilityIdentifier("scan.shell.frame")
+
+                Text("Karte innerhalb des Rahmens halten, Blendung vermeiden.")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.8))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 16)
+                    .accessibilityIdentifier("scan.shell.guidance")
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .allowsHitTesting(false)
+            .accessibilityElement(children: .contain)
         }
     }
 
     private var cameraPreview: some View {
-        ZStack(alignment: .bottom) {
-            CameraPreviewView(session: camera.session)
-                .frame(height: 280)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        CameraPreviewView(camera: camera)
+    }
 
-            HStack(spacing: 14) {
-                Button {
-                    captureFromCamera()
-                } label: {
-                    Label("Aufnehmen", systemImage: "camera.circle.fill")
+    private var resultSheetContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Capsule()
+                .fill(.tertiary)
+                .frame(width: 38, height: 5)
+                .frame(maxWidth: .infinity)
+                .padding(.top, 8)
+
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Ergebnis")
                         .font(.headline)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(isProcessing)
 
-                if let targetCollectionName {
-                    Text("Ziel: \(targetCollectionName)")
-                        .font(.caption)
+                    Text(accessorySummary)
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(.ultraThinMaterial, in: Capsule())
                 }
-            }
-            .padding(.bottom, 12)
-        }
-    }
 
-    private var recentPhotosSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Letzte Fotos")
-                    .font(.headline)
                 Spacer()
-                if recentPhotos.authorizationStatus == .limited {
-                    Button("Auswahl erweitern") {
-                        recentPhotos.presentLimitedLibraryPicker()
-                    }
-                    .font(.caption)
-                }
-            }
 
-            switch recentPhotos.authorizationStatus {
-            case .authorized, .limited:
-                if recentPhotos.items.isEmpty {
-                    Button("Aktualisieren") {
-                        recentPhotos.loadRecent()
-                    }
-                    .buttonStyle(.bordered)
-                } else {
-                    ScrollView(.horizontal) {
-                        HStack(spacing: 8) {
-                            ForEach(recentPhotos.items) { item in
-                                Button {
-                                    Task {
-                                        await scanRecentPhoto(item)
-                                    }
-                                } label: {
-                                    Image(uiImage: item.thumbnail)
-                                        .resizable()
-                                        .scaledToFill()
-                                        .frame(width: 72, height: 72)
-                                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                }
-                                .buttonStyle(.plain)
-                                .disabled(isProcessing)
-                            }
-                        }
-                    }
+                if isProcessing {
+                    ProgressView()
+                        .controlSize(.small)
                 }
-            case .notDetermined:
-                permissionCard(
-                    title: "Fotozugriff bei Bedarf",
-                    message: "Nur fuer die letzten Fotos im Scan-Screen.",
-                    primaryTitle: "Fotos erlauben"
-                ) {
-                    Task {
-                        let status = await recentPhotos.requestAccessIfNeeded()
-                        if status == .authorized || status == .limited {
-                            recentPhotos.loadRecent()
-                        }
-                    }
-                }
-            case .denied, .restricted:
-                permissionCard(
-                    title: "Fotos nicht verfuegbar",
-                    message: "Aktiviere Zugriff in den Einstellungen oder waehle spaeter manuell.",
-                    primaryTitle: "Einstellungen öffnen"
-                ) {
-                    openSettings()
-                }
-            @unknown default:
-                EmptyView()
-            }
-        }
-    }
-
-    private var scanResultSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Ergebnis")
-                .font(.headline)
-
-            if isProcessing {
-                ProgressView("Karte wird erkannt...")
-            } else if scanOutcome.candidates.isEmpty {
-                Text("Noch kein Treffer. Nutze Kamera, letzte Fotos oder die manuelle Suche.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            } else {
-                if scanOutcome.state == .uncertain {
-                    Text("Die Erkennung ist nicht ganz sicher. Bitte Kandidat kurz pruefen.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-
-                if scanOutcome.state == .strong {
-                    Text("Top-Treffer gefunden. Du kannst vor dem Speichern noch anpassen.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-
-                candidatePicker
-                saveForm
             }
 
             if let infoMessage {
@@ -252,7 +327,79 @@ struct ScanTabView: View {
                 Text(errorMessage)
                     .font(.footnote)
                     .foregroundStyle(.red)
+                    .accessibilityIdentifier("scan.error.message")
             }
+
+            scanResultSection
+
+            VStack(alignment: .leading, spacing: 10) {
+                Divider()
+
+                Text("Manuelle Suche")
+                    .font(.subheadline.weight(.semibold))
+
+                manualSearchSection
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.bottom, 16)
+        .padding(.top, 4)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("scan.sheet.root")
+    }
+
+    private var hasActiveScannerInterruption: Bool {
+        if case .interrupted = camera.interruptionState {
+            return true
+        }
+
+        return false
+    }
+
+    private var accessorySummary: String {
+        if isProcessing {
+            return "Die letzte Aufnahme wird gerade verarbeitet."
+        }
+
+        if !scanOutcome.candidates.isEmpty {
+            switch scanOutcome.state {
+            case .strong:
+                return "Top-Treffer gefunden. Vor dem Speichern kannst du ihn noch pruefen."
+            case .uncertain:
+                return "Bitte Kandidat kurz pruefen, die Erkennung ist nicht ganz sicher."
+            case .noMatch:
+                break
+            }
+        }
+
+        return "Noch kein Treffer. Kamera oder letztes Foto starten den Lookup, Suche bleibt als Fallback erreichbar."
+    }
+
+    private var scanResultSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if scanOutcome.candidates.isEmpty {
+                Text("Noch kein Treffer. Nutze die Kamera oder das letzte Foto, um Kandidaten hier einzuchecken.")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("scan.results.empty")
+            } else {
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        candidatePicker
+                        saveForm
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 2)
+                }
+                .frame(maxHeight: 260)
+            }
+
+            #if DEBUG
+            if let lastPipelineResult {
+                debugPanel(for: lastPipelineResult)
+            }
+            #endif
         }
     }
 
@@ -303,11 +450,15 @@ struct ScanTabView: View {
 
     private var manualSearchSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Manuelle Suche")
-                .font(.headline)
-
             TextField("Name, Set oder Nummer", text: $manualSearchQuery)
                 .textFieldStyle(.roundedBorder)
+                .submitLabel(.search)
+                .focused($isManualSearchFocused)
+                .onSubmit {
+                    Task {
+                        await performManualLookup()
+                    }
+                }
                 .accessibilityIdentifier("scan.manual.query")
 
             Button("Suche starten") {
@@ -318,6 +469,55 @@ struct ScanTabView: View {
             .accessibilityIdentifier("scan.manual.submit")
             .buttonStyle(.bordered)
             .disabled(manualSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isProcessing)
+
+            if recentPhotos.authorizationStatus == .limited {
+                Button("Fotoauswahl erweitern") {
+                    recentPhotos.presentLimitedLibraryPicker()
+                }
+                .font(.footnote)
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+
+    private func handleCaptureButtonTap() {
+        switch camera.authorizationStatus {
+        case .authorized:
+            captureFromCamera()
+        case .notDetermined:
+            Task {
+                if await camera.requestAccessIfNeeded() {
+                    camera.startSessionIfAuthorized()
+                }
+            }
+        case .denied, .restricted:
+            openSettings()
+        @unknown default:
+            openSettings()
+        }
+    }
+
+    private func handleRecentPhotoShortcutTap() {
+        switch recentPhotos.authorizationStatus {
+        case .authorized, .limited:
+            if let latestItem = recentPhotos.latestItem {
+                Task {
+                    await scanRecentPhoto(latestItem)
+                }
+            } else {
+                recentPhotos.loadRecent()
+            }
+        case .notDetermined:
+            Task {
+                let status = await recentPhotos.requestAccessIfNeeded()
+                if status == .authorized || status == .limited {
+                    recentPhotos.loadRecent()
+                }
+            }
+        case .denied, .restricted:
+            openSettings()
+        @unknown default:
+            recentPhotos.loadRecent()
         }
     }
 
@@ -329,11 +529,6 @@ struct ScanTabView: View {
         allCollections.sorted {
             $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
         }
-    }
-
-    private var targetCollectionName: String? {
-        guard let selectedTargetCollectionID else { return nil }
-        return collections.first(where: { $0.id == selectedTargetCollectionID })?.name
     }
 
     private func prepareDefaultsIfNeeded() {
@@ -353,14 +548,18 @@ struct ScanTabView: View {
                     await recognizeAndLookup(input: .captured(image))
                 }
             case .failure:
+                logger.error("Capture failed before OCR")
                 errorMessage = "Foto konnte nicht aufgenommen werden."
+                isResultSheetPresented = true
             }
         }
     }
 
     private func scanRecentPhoto(_ item: RecentPhotoLibraryService.Item) async {
         guard let image = await recentPhotos.loadFullImage(for: item) else {
+            logger.error("Import failed before OCR")
             errorMessage = "Foto konnte nicht geladen werden."
+            isResultSheetPresented = true
             return
         }
         await recognizeAndLookup(input: .imported(image))
@@ -371,23 +570,43 @@ struct ScanTabView: View {
         isProcessing = true
         errorMessage = nil
         infoMessage = nil
+        lastPipelineResult = nil
 
         do {
             let pipelineResult = try await scanPipeline.process(input: input, settings: .default)
+            lastPipelineResult = pipelineResult
             lastHints = pipelineResult.hints
 
-            let candidates = await lookupService.lookupCandidates(
+            if pipelineResult.usedFullImageFallback {
+                appendInfoMessage("Kartenrahmen nicht sicher erkannt. Vollbild-Fallback wurde verwendet.")
+            }
+
+            guard !pipelineResult.recognizedFields.isEmpty,
+                  !pipelineResult.hints.normalizedQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                logger.info("OCR produced no high-confidence fields")
+                scanOutcome = .init(state: .noMatch, candidates: [])
+                selectedCandidateID = nil
+                errorMessage = "Es konnten keine verlässlichen Kartenfelder erkannt werden."
+                isResultSheetPresented = true
+                isProcessing = false
+                return
+            }
+
+            let lookupResponse = await scanLookupService.lookupScanCandidates(
                 for: CardLookupRequest(
                     recognizedTexts: pipelineResult.recognizedTexts,
+                    query: pipelineResult.hints.normalizedQuery,
                     hints: pipelineResult.hints,
                     maxResults: 3
                 )
             )
 
-            let outcome = ScanResultPolicy.evaluate(candidates: candidates, maxCandidates: 3)
-            applyLookupOutcome(outcome, hints: pipelineResult.hints)
+            let outcome = ScanResultPolicy.evaluate(candidates: lookupResponse.candidates, maxCandidates: 3)
+            applyLookupOutcome(outcome, hints: pipelineResult.hints, lookupResponse: lookupResponse)
         } catch {
+            logger.error("Scan recognition failed: \(error.localizedDescription, privacy: .public)")
             errorMessage = "Erkennung fehlgeschlagen. Bitte erneut versuchen."
+            isResultSheetPresented = true
         }
 
         isProcessing = false
@@ -396,8 +615,10 @@ struct ScanTabView: View {
     @MainActor
     private func performManualLookup() async {
         isProcessing = true
+        isManualSearchFocused = false
         errorMessage = nil
         infoMessage = nil
+        lastPipelineResult = nil
 
         let query = manualSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         let hints = ScanLookupHints(
@@ -407,20 +628,51 @@ struct ScanTabView: View {
         )
 
         let candidates = await lookupService.lookupCandidates(
-            for: CardLookupRequest(recognizedTexts: [query], hints: hints, maxResults: 3)
+            for: CardLookupRequest(recognizedTexts: [query], query: query, hints: hints, maxResults: 3)
         )
         let outcome = ScanResultPolicy.evaluate(candidates: candidates, maxCandidates: 3)
-        applyLookupOutcome(outcome, hints: hints)
+        applyLookupOutcome(outcome, hints: hints, lookupResponse: nil)
         isProcessing = false
     }
 
-    private func applyLookupOutcome(_ outcome: ScanResultPolicy.Outcome, hints: ScanLookupHints) {
+    private func applyLookupOutcome(
+        _ outcome: ScanResultPolicy.Outcome,
+        hints: ScanLookupHints,
+        lookupResponse: ScanLookupResponse?
+    ) {
         scanOutcome = outcome
         selectedCandidateID = outcome.candidates.first?.id
+        isResultSheetPresented = true
+
+        if let lookupResponse, lookupResponse.attempts.count > 1 {
+            appendInfoMessage("Suche mit \(lookupResponse.attempts.count) Varianten verfeinert.")
+            selectedResultSheetDetent = .medium
+        }
 
         if case .manualSearch(let prefilledQuery) = ScanFlowRoutingPolicy.nextStep(outcome: outcome, hints: hints), !prefilledQuery.isEmpty {
             manualSearchQuery = prefilledQuery
-            infoMessage = "Kein sicherer Treffer. Manuelle Suche wurde mit Hinweisen vorbelegt."
+            appendInfoMessage("Manuelle Suche wurde mit Hinweisen vorbelegt.")
+        }
+
+        if outcome.state == .noMatch {
+            logger.info("Lookup returned no candidates")
+            errorMessage = "Kein passender Kartenkandidat gefunden."
+            selectedResultSheetDetent = .medium
+        }
+    }
+
+    private func appendInfoMessage(_ message: String) {
+        guard !message.isEmpty else {
+            return
+        }
+
+        guard let current = infoMessage, !current.isEmpty else {
+            infoMessage = message
+            return
+        }
+
+        if !current.contains(message) {
+            infoMessage = "\(current) \(message)"
         }
     }
 
@@ -483,6 +735,7 @@ struct ScanTabView: View {
         targetCollection.lastUsedAt = .now
         AppStateAccess.setActiveCollectionID(targetCollection.id, in: modelContext)
         try? modelContext.save()
+        isResultSheetPresented = false
         clearTransientScanState()
     }
 
@@ -605,6 +858,30 @@ struct ScanTabView: View {
         formatter.locale = .autoupdatingCurrent
         return formatter.string(from: decimal as NSDecimalNumber) ?? "-"
     }
+
+    #if DEBUG
+    @ViewBuilder
+    private func debugPanel(for result: ScanPipelineResult) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Debug")
+                .font(.caption.weight(.semibold))
+            Text("Query: \(result.hints.normalizedQuery.isEmpty ? "-" : result.hints.normalizedQuery)")
+                .font(.caption2)
+            ForEach(Array(result.recognizedFields.prefix(3).enumerated()), id: \.offset) { _, field in
+                Text("\(field.region.rawValue): \(field.text) (\(Int(field.confidence * 100))%)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(.secondary.opacity(0.08))
+        )
+        .accessibilityIdentifier("scan.debug.panel")
+    }
+    #endif
 }
 
 private struct CandidateRowView: View {
@@ -681,26 +958,116 @@ private struct CandidateThumbnailView: View {
 }
 
 private struct CameraPreviewView: UIViewRepresentable {
-    let session: AVCaptureSession
+    @ObservedObject var camera: CameraCaptureService
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(camera: camera)
+    }
 
     func makeUIView(context: Context) -> PreviewView {
         let view = PreviewView()
         view.previewLayer.videoGravity = .resizeAspectFill
-        view.previewLayer.session = session
+        view.previewLayer.session = camera.session
+        view.tapHandler = { point in
+            Task { @MainActor in
+                camera.focusAndExpose(atPreviewPoint: point)
+            }
+        }
+        camera.attachPreviewLayer(view.previewLayer)
         return view
     }
 
     func updateUIView(_ uiView: PreviewView, context: Context) {
-        uiView.previewLayer.session = session
+        uiView.previewLayer.session = camera.session
+        uiView.tapHandler = { point in
+            Task { @MainActor in
+                camera.focusAndExpose(atPreviewPoint: point)
+            }
+        }
+        camera.attachPreviewLayer(uiView.previewLayer)
+    }
+
+    static func dismantleUIView(_ uiView: PreviewView, coordinator: Coordinator) {
+        uiView.prepareForTeardown()
+        Task { @MainActor in
+            coordinator.camera?.detachPreviewLayer()
+        }
+    }
+
+    final class Coordinator {
+        weak var camera: CameraCaptureService?
+
+        init(camera: CameraCaptureService) {
+            self.camera = camera
+        }
     }
 
     final class PreviewView: UIView {
+        var tapHandler: ((CGPoint) -> Void)?
+
         override class var layerClass: AnyClass {
             AVCaptureVideoPreviewLayer.self
+        }
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            let tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+            addGestureRecognizer(tapRecognizer)
+        }
+
+        required init?(coder: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
         }
 
         var previewLayer: AVCaptureVideoPreviewLayer {
             layer as! AVCaptureVideoPreviewLayer
         }
+
+        func prepareForTeardown() {
+            tapHandler = nil
+            previewLayer.session = nil
+        }
+
+        @objc private func handleTap(_ recognizer: UITapGestureRecognizer) {
+            tapHandler?(recognizer.location(in: self))
+        }
+    }
+}
+
+private struct ScannerFocusOverlayView: View {
+    let focusState: CameraCaptureService.FocusIndicatorState
+    let isVisible: Bool
+
+    var body: some View {
+        GeometryReader { proxy in
+            if isVisible && focusState.phase == .active {
+                ScannerFocusIndicatorView(state: indicatorState)
+                    .frame(width: 58, height: 58)
+                    .position(indicatorPosition(in: proxy.size))
+                    .accessibilityIdentifier("scan.shell.focusIndicator")
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var indicatorState: ScannerFocusIndicatorView.State {
+        switch focusState.phase {
+        case .idle:
+            return .idle
+        case .active:
+            return .active
+        }
+    }
+
+    private func indicatorPosition(in size: CGSize) -> CGPoint {
+        if let previewPoint = focusState.previewPoint {
+            return CGPoint(
+                x: min(max(previewPoint.x, 29), max(size.width - 29, 29)),
+                y: min(max(previewPoint.y, 29), max(size.height - 29, 29))
+            )
+        }
+
+        return CGPoint(x: size.width / 2, y: size.height / 2)
     }
 }

@@ -15,6 +15,10 @@ final class RecentPhotoLibraryService: NSObject, ObservableObject {
     @Published private(set) var authorizationStatus: PHAuthorizationStatus
     @Published private(set) var items: [Item] = []
 
+    var latestItem: Item? {
+        items.first
+    }
+
     private let imageManager = PHCachingImageManager()
 
     override init() {
@@ -82,8 +86,9 @@ final class RecentPhotoLibraryService: NSObject, ObservableObject {
             options.resizeMode = .none
             options.isNetworkAccessAllowed = true
 
-            imageManager.requestImageDataAndOrientation(for: asset, options: options) { data, _, _, _ in
-                guard let data, let image = UIImage(data: data) else {
+            imageManager.requestImageDataAndOrientation(for: asset, options: options) { data, _, orientation, _ in
+                guard let data,
+                      let image = ScanImagePreprocessor.image(from: data, orientation: orientation) else {
                     continuation.resume(returning: nil)
                     return
                 }
