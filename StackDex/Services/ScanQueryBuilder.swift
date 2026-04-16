@@ -2,9 +2,10 @@ import CoreGraphics
 import Foundation
 
 enum ScanOCRRegion: String, Equatable {
-    case nameBand
-    case numberBandLeft
-    case numberBandRight
+    case titleStrip
+    case evolutionLine
+    case attackBox
+    case collectorFooter
     case fullCardFallback
 }
 
@@ -40,6 +41,10 @@ struct ScanQueryBuilder {
         "attack", "ability", "effects", "effekt", "stapelt", "nicht",
     ]
     private let nameSuffixTokens: Set<String> = ["ex", "gx", "v", "vmax", "vstar", "lv", "lvl", "star"]
+    private let nameSentenceStopWords: Set<String> = [
+        "sich", "aus", "von", "vom", "zur", "zum", "the", "of", "from",
+        "during", "this", "your", "if",
+    ]
 
     func buildHints(from fields: [RecognizedCardField]) -> ScanLookupHints {
         let cleanedFields = fields
@@ -59,12 +64,10 @@ struct ScanQueryBuilder {
         let possibleRarities = rarityCandidates(from: cleanedFields)
         let possibleLanguages = languageCandidates(from: cleanedFields)
 
-        let fallbackTokens = rankedFallbackTokens(from: cleanedFields)
         let normalizedQuery = structuredQuery(
             preferredName: preferredName,
             possibleNumbers: possibleNumbers,
-            possibleSetCodes: possibleSetCodes,
-            fallbackTokens: fallbackTokens
+            possibleSetCodes: possibleSetCodes
         )
 
         let nameTokens: [String]
@@ -86,33 +89,22 @@ struct ScanQueryBuilder {
     }
 
     private func preferredName(from fields: [RecognizedCardField]) -> String? {
-        let bestInNameBand = fields
-            .filter { $0.region == .nameBand }
+        let bestInTitleStrip = fields
+            .filter { $0.region == .titleStrip }
             .sorted(by: fieldPriority)
             .first(where: { looksLikeNameField($0.text) })
 
-        if let bestInNameBand {
-            return bestInNameBand.text
+        if let bestInTitleStrip {
+            return bestInTitleStrip.text
         }
 
-        return fields
-            .filter { $0.region == .fullCardFallback }
-            .sorted(by: fieldPriority)
-            .first(where: {
-                let tokenCount = tokenize($0.text).count
-                return tokenCount > 0
-                    && tokenCount <= 3
-                    && $0.confidence >= 0.6
-                    && looksLikeFallbackNameField($0.text)
-            })?
-            .text
+        return nil
     }
 
     private func structuredQuery(
         preferredName: String?,
         possibleNumbers: [String],
-        possibleSetCodes: [String],
-        fallbackTokens: [String]
+        possibleSetCodes: [String]
     ) -> String {
         let trimmedName = preferredName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         let number = possibleNumbers.first
@@ -142,16 +134,7 @@ struct ScanQueryBuilder {
             return number
         }
 
-        let hasStrongSignal = (trimmedName != nil) || (number?.contains("/") == true)
-        guard hasStrongSignal else {
-            return ""
-        }
-
-        guard shouldUseFallbackTokens(fallbackTokens) else {
-            return ""
-        }
-
-        return fallbackTokens.joined(separator: " ")
+        return ""
     }
 
     private func numberCandidates(from fields: [RecognizedCardField]) -> [String] {
@@ -160,7 +143,7 @@ struct ScanQueryBuilder {
 
         let ranked = fields
             .sorted(by: fieldPriority)
-            .filter { $0.region == .numberBandLeft || $0.region == .numberBandRight || isNumberLike($0.text) }
+            .filter { $0.region == .collectorFooter || isNumberLike($0.text) }
 
         for field in ranked {
             let allowSimpleNumericToken = field.region != .fullCardFallback
@@ -183,32 +166,66 @@ struct ScanQueryBuilder {
         var seen: Set<String> = []
         var setCodes: [String] = []
 
-        let ranked = fields
+        let footerFields = fields
             .sorted(by: fieldPriority)
-            .filter { $0.region == .numberBandLeft || $0.region == .numberBandRight || $0.region == .fullCardFallback }
+            .filter { $0.region == .collectorFooter }
 
-        let regionsWithCollectorNumbers = Set(
-            ranked
-                .filter { tokenizeNumberCandidates($0.text).contains(where: { $0.contains("/") }) }
-                .map(\.region)
-        )
-
-        guard !regionsWithCollectorNumbers.isEmpty else {
-            return []
-        }
-
-        for field in ranked {
-            guard regionsWithCollectorNumbers.contains(field.region) else {
+        for field in footerFields {
+            let tokens: [String]
+            tokens = tokensNearCollectorNumber(in: field.text)
+            if tokens.isEmpty {
                 continue
             }
 
-            let tokens: [String]
-            if field.region == .fullCardFallback {
-                tokens = tokensNearCollectorNumber(in: field.text)
-            } else {
-                tokens = tokenize(field.text)
+            for token in tokens {
+                let normalized = normalizeAlphaNumeric(token).uppercased()
+                guard normalized.count >= 2, normalized.count <= 5 else { continue }
+                guard !languageTokens.contains(normalized) else { continue }
+                guard !setCodeStopWords.contains(normalized) else { continue }
+                guard !isNumberLike(normalized) else { continue }
+                guard !noisyBodyKeywords.contains(normalized.lowercased()) else { continue }
+                guard !isRarityToken(normalized.lowercased()) else { continue }
+                guard looksLikeSetCode(normalized) else { continue }
+                guard seen.insert(normalized).inserted else { continue }
+                setCodes.append(normalized)
+                if setCodes.count == 4 {
+                    return setCodes
+                }
             }
+        }
 
+        if !setCodes.isEmpty {
+            return setCodes
+        }
+
+        for field in footerFields {
+            for token in tokenize(field.text) {
+                let normalized = normalizeAlphaNumeric(token).uppercased()
+                guard normalized.count >= 2, normalized.count <= 5 else { continue }
+                guard !languageTokens.contains(normalized) else { continue }
+                guard !setCodeStopWords.contains(normalized) else { continue }
+                guard !isNumberLike(normalized) else { continue }
+                guard !noisyBodyKeywords.contains(normalized.lowercased()) else { continue }
+                guard !isRarityToken(normalized.lowercased()) else { continue }
+                guard looksLikeSetCode(normalized) else { continue }
+                guard seen.insert(normalized).inserted else { continue }
+                setCodes.append(normalized)
+                if setCodes.count == 4 {
+                    return setCodes
+                }
+            }
+        }
+
+        if !setCodes.isEmpty {
+            return setCodes
+        }
+
+        let fallbackFields = fields
+            .sorted(by: fieldPriority)
+            .filter { $0.region == .fullCardFallback }
+
+        for field in fallbackFields {
+            let tokens = tokensNearCollectorNumber(in: field.text)
             for token in tokens {
                 let normalized = normalizeAlphaNumeric(token).uppercased()
                 guard normalized.count >= 2, normalized.count <= 5 else { continue }
@@ -317,7 +334,7 @@ struct ScanQueryBuilder {
         var tokens: [String] = []
 
         for field in fields.sorted(by: fieldPriority) {
-            if field.region == .fullCardFallback && isLikelyBodyNoise(field.text) {
+            if field.region == .attackBox || field.region == .evolutionLine || (field.region == .fullCardFallback && isLikelyBodyNoise(field.text)) {
                 continue
             }
 
@@ -448,6 +465,15 @@ struct ScanQueryBuilder {
     }
 
     private func looksLikeNameField(_ text: String) -> Bool {
+        let lowercasedText = text.lowercased()
+        if lowercasedText.contains("entwickelt sich aus") || lowercasedText.contains("evolves from") {
+            return false
+        }
+
+        if hasTrailingAttackDamageValue(text) {
+            return false
+        }
+
         let tokens = tokenizeName(text)
         guard !tokens.isEmpty else {
             return false
@@ -466,6 +492,11 @@ struct ScanQueryBuilder {
             return false
         }
 
+        let sentenceStopWordCount = tokens.filter { nameSentenceStopWords.contains($0.lowercased()) }.count
+        if sentenceStopWordCount >= 2 {
+            return false
+        }
+
         if tokens.count == 1, let token = tokens.first {
             let digitCount = token.filter(\.isNumber).count
             if token.first?.isNumber == true || digitCount >= 2 {
@@ -474,6 +505,21 @@ struct ScanQueryBuilder {
         }
 
         return true
+    }
+
+    private func hasTrailingAttackDamageValue(_ text: String) -> Bool {
+        let normalized = normalizeWhitespace(text)
+        let parts = normalized.split(separator: " ")
+        guard parts.count >= 2, let last = parts.last else {
+            return false
+        }
+
+        guard String(last).range(of: "^[0-9]{2,3}$", options: .regularExpression) != nil else {
+            return false
+        }
+
+        let hasCollectorNumber = parts.contains(where: { $0.contains("/") })
+        return !hasCollectorNumber
     }
 
     private func looksLikeFallbackNameField(_ text: String) -> Bool {
@@ -506,7 +552,13 @@ struct ScanQueryBuilder {
     }
 
     private func fieldPriority(_ lhs: RecognizedCardField, _ rhs: RecognizedCardField) -> Bool {
-        let rank: [ScanOCRRegion: Int] = [.nameBand: 5, .numberBandLeft: 4, .numberBandRight: 3, .fullCardFallback: 1]
+        let rank: [ScanOCRRegion: Int] = [
+            .titleStrip: 6,
+            .collectorFooter: 5,
+            .evolutionLine: 2,
+            .attackBox: 1,
+            .fullCardFallback: 0,
+        ]
         let lhsRank = rank[lhs.region, default: 0]
         let rhsRank = rank[rhs.region, default: 0]
         if lhsRank != rhsRank {

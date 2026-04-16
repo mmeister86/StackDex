@@ -15,7 +15,7 @@ struct VisionScanPipelineServiceTests {
         let artifacts = try await service.inspect(input: .captured(image))
 
         let nameTexts = artifacts.recognizedFields
-            .filter { $0.region == .nameBand }
+            .filter { $0.region == .titleStrip }
             .map { $0.text.lowercased() }
         #expect(nameTexts.contains(where: { $0.contains("pikachu") }))
     }
@@ -30,9 +30,9 @@ struct VisionScanPipelineServiceTests {
 
     @Test func noisyBodyTextDoesNotDominateStructuredQuery() async throws {
         let fields: [RecognizedCardField] = [
-            .init(text: "Pikachu ex", confidence: 0.96, region: .nameBand, boundingBox: CGRect(x: 0.1, y: 0.05, width: 0.7, height: 0.1)),
-            .init(text: "Thunderbolt spark charge", confidence: 0.91, region: .fullCardFallback, boundingBox: CGRect(x: 0.1, y: 0.3, width: 0.8, height: 0.3)),
-            .init(text: "199/091", confidence: 0.89, region: .numberBandLeft, boundingBox: CGRect(x: 0.68, y: 0.88, width: 0.2, height: 0.06)),
+            .init(text: "Pikachu ex", confidence: 0.96, region: .titleStrip, boundingBox: CGRect(x: 0.1, y: 0.05, width: 0.7, height: 0.1)),
+            .init(text: "Thunderbolt spark charge", confidence: 0.91, region: .attackBox, boundingBox: CGRect(x: 0.1, y: 0.3, width: 0.8, height: 0.3)),
+            .init(text: "199/091", confidence: 0.89, region: .collectorFooter, boundingBox: CGRect(x: 0.68, y: 0.88, width: 0.2, height: 0.06)),
         ]
 
         let hints = ScanQueryBuilder().buildHints(from: fields)

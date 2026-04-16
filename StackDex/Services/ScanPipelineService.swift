@@ -140,9 +140,10 @@ struct VisionScanPipelineService: ScanPipelineServing {
         logger.info("Scan source=\(normalized.source.logName, privacy: .public) detectorFallback=\(cardImage.usedFallback, privacy: .public)")
 
         var fields: [RecognizedCardField] = []
-        fields += recognizeText(in: cardImage, region: .nameBand, settings: configuredSettings(for: .nameBand, base: settings))
-        fields += recognizeText(in: cardImage, region: .numberBandLeft, settings: configuredSettings(for: .numberBandLeft, base: settings))
-        fields += recognizeText(in: cardImage, region: .numberBandRight, settings: configuredSettings(for: .numberBandRight, base: settings))
+        fields += recognizeText(in: cardImage, region: .titleStrip, settings: configuredSettings(for: .titleStrip, base: settings))
+        fields += recognizeText(in: cardImage, region: .evolutionLine, settings: configuredSettings(for: .evolutionLine, base: settings))
+        fields += recognizeText(in: cardImage, region: .attackBox, settings: configuredSettings(for: .attackBox, base: settings))
+        fields += recognizeText(in: cardImage, region: .collectorFooter, settings: configuredSettings(for: .collectorFooter, base: settings))
         fields += recognizeText(in: cardImage, region: .fullCardFallback, settings: configuredSettings(for: .fullCardFallback, base: settings))
 
         return ScanPipelineArtifacts(
@@ -208,16 +209,18 @@ struct VisionScanPipelineService: ScanPipelineServing {
         settings.usesLanguageCorrection = false
 
         switch region {
-        case .nameBand:
+        case .titleStrip:
             settings.usesLanguageCorrection = true
-            settings.minimumTextHeight = 0.026
+            settings.minimumTextHeight = 0.022
             settings.customConfigure = { request in
                 request.customWords = nameCustomWords
                 request.automaticallyDetectsLanguage = true
             }
-        case .numberBandLeft:
+        case .collectorFooter:
             settings.minimumTextHeight = 0.02
-        case .numberBandRight:
+        case .evolutionLine:
+            settings.minimumTextHeight = 0.018
+        case .attackBox:
             settings.minimumTextHeight = 0.02
         case .fullCardFallback:
             settings.minimumTextHeight = 0.028
@@ -228,10 +231,12 @@ struct VisionScanPipelineService: ScanPipelineServing {
 
     private func confidenceThreshold(for region: ScanOCRRegion) -> Float {
         switch region {
-        case .nameBand:
-            return 0.3
-        case .numberBandLeft, .numberBandRight:
+        case .titleStrip:
+            return 0.28
+        case .collectorFooter:
             return 0.34
+        case .evolutionLine, .attackBox:
+            return 0.36
         case .fullCardFallback:
             return 0.44
         }
@@ -249,12 +254,14 @@ struct VisionScanPipelineService: ScanPipelineServing {
 
     private func normalizedRegionRect(for region: ScanOCRRegion) -> CGRect {
         switch region {
-        case .nameBand:
-            return CGRect(x: 0.04, y: 0.01, width: 0.92, height: 0.3)
-        case .numberBandLeft:
-            return CGRect(x: 0.04, y: 0.74, width: 0.52, height: 0.22)
-        case .numberBandRight:
-            return CGRect(x: 0.5, y: 0.74, width: 0.46, height: 0.22)
+        case .titleStrip:
+            return CGRect(x: 0.04, y: 0.02, width: 0.92, height: 0.2)
+        case .evolutionLine:
+            return CGRect(x: 0.06, y: 0.2, width: 0.88, height: 0.1)
+        case .attackBox:
+            return CGRect(x: 0.06, y: 0.38, width: 0.88, height: 0.38)
+        case .collectorFooter:
+            return CGRect(x: 0.04, y: 0.74, width: 0.92, height: 0.22)
         case .fullCardFallback:
             return CGRect(x: 0, y: 0, width: 1, height: 1)
         }
@@ -273,6 +280,9 @@ struct VisionScanPipelineService: ScanPipelineServing {
         var seen: Set<String> = []
         var texts: [String] = []
         for field in fields.sorted(by: fieldPriority) {
+            guard field.region == .titleStrip || field.region == .collectorFooter else {
+                continue
+            }
             let normalized = field.text.lowercased()
             guard seen.insert(normalized).inserted else { continue }
             texts.append(field.text)
@@ -293,7 +303,13 @@ struct VisionScanPipelineService: ScanPipelineServing {
     }
 
     private func fieldPriority(_ lhs: RecognizedCardField, _ rhs: RecognizedCardField) -> Bool {
-        let regionRank: [ScanOCRRegion: Int] = [.nameBand: 5, .numberBandLeft: 4, .numberBandRight: 3, .fullCardFallback: 1]
+        let regionRank: [ScanOCRRegion: Int] = [
+            .titleStrip: 6,
+            .collectorFooter: 5,
+            .evolutionLine: 2,
+            .attackBox: 1,
+            .fullCardFallback: 0,
+        ]
         let lhsRank = regionRank[lhs.region, default: 0]
         let rhsRank = regionRank[rhs.region, default: 0]
         if lhsRank != rhsRank {

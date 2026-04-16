@@ -10,12 +10,14 @@ describe("cards.lookup action handler", () => {
   });
 
   it("enforces strict response schema version negotiation", async () => {
-    const fetchCards = vi.fn();
+    const fetchPrimaryCards = vi.fn();
+    const fetchFallbackCards = vi.fn();
 
     await expect(
       lookupHandler(
         {
-          fetchCards,
+          fetchPrimaryCards,
+          fetchFallbackCards,
         },
         {
           query: "charizard",
@@ -28,15 +30,18 @@ describe("cards.lookup action handler", () => {
       "Unsupported responseSchemaVersion \"cards.lookup.v2\". Supported version: cards.lookup.v1",
     );
 
-    expect(fetchCards).not.toHaveBeenCalled();
+    expect(fetchPrimaryCards).not.toHaveBeenCalled();
+    expect(fetchFallbackCards).not.toHaveBeenCalled();
   });
 
-  it("returns versioned envelope with empty candidates", async () => {
-    const fetchCards = vi.fn().mockResolvedValue([]);
+  it("returns versioned envelope with empty candidates when both providers return nothing", async () => {
+    const fetchPrimaryCards = vi.fn().mockResolvedValue([]);
+    const fetchFallbackCards = vi.fn().mockResolvedValue([]);
 
     const result = await lookupHandler(
       {
-        fetchCards,
+        fetchPrimaryCards,
+        fetchFallbackCards,
       },
       {
         query: "no results",
@@ -46,6 +51,8 @@ describe("cards.lookup action handler", () => {
       },
     );
 
+    expect(fetchPrimaryCards).toHaveBeenCalledTimes(1);
+    expect(fetchFallbackCards).toHaveBeenCalledTimes(1);
     expect(result).toEqual({
       schemaVersion: CARDS_LOOKUP_SCHEMA_VERSION,
       payload: {
@@ -54,12 +61,23 @@ describe("cards.lookup action handler", () => {
     });
   });
 
-  it("forwards hints and lookup args to backend internals", async () => {
-    const fetchCards = vi.fn().mockResolvedValue([]);
+  it("forwards hints and lookup args to primary backend", async () => {
+    const fetchPrimaryCards = vi.fn().mockResolvedValue([
+      {
+        id: "base1-4",
+        name: "Charizard",
+        prices: {
+          market: 1,
+          conditions: {},
+        },
+      },
+    ]);
+    const fetchFallbackCards = vi.fn();
 
     await lookupHandler(
       {
-        fetchCards,
+        fetchPrimaryCards,
+        fetchFallbackCards,
       },
       {
         query: "charizard 4/102",
@@ -77,7 +95,7 @@ describe("cards.lookup action handler", () => {
       },
     );
 
-    expect(fetchCards).toHaveBeenCalledWith({
+    expect(fetchPrimaryCards).toHaveBeenCalledWith({
       query: "charizard 4/102",
       recognizedTexts: ["charizard", "4/102"],
       maxResults: 5,
@@ -90,5 +108,77 @@ describe("cards.lookup action handler", () => {
         possibleLanguages: ["EN"],
       },
     });
+    expect(fetchFallbackCards).not.toHaveBeenCalled();
+  });
+
+  it("uses fallback backend when primary result is empty", async () => {
+    const fetchPrimaryCards = vi.fn().mockResolvedValue([]);
+    const fetchFallbackCards = vi.fn().mockResolvedValue([
+      {
+        id: "base1-25",
+        name: "Pikachu",
+        prices: {
+          market: 9,
+          conditions: {},
+        },
+      },
+    ]);
+
+    const result = await lookupHandler(
+      {
+        fetchPrimaryCards,
+        fetchFallbackCards,
+      },
+      {
+        query: "pikachu",
+        recognizedTexts: ["pikachu"],
+        maxResults: 3,
+        responseSchemaVersion: CARDS_LOOKUP_SCHEMA_VERSION,
+      },
+    );
+
+    expect(fetchPrimaryCards).toHaveBeenCalledTimes(1);
+    expect(fetchFallbackCards).toHaveBeenCalledTimes(1);
+    expect(result.payload.candidates).toEqual([
+      {
+        id: "base1-25",
+        name: "Pikachu",
+        prices: {
+          market: 9,
+          conditions: {},
+        },
+      },
+    ]);
+  });
+
+  it("uses fallback backend when primary provider throws", async () => {
+    const fetchPrimaryCards = vi.fn().mockRejectedValue(new Error("primary unavailable"));
+    const fetchFallbackCards = vi.fn().mockResolvedValue([
+      {
+        id: "base1-6",
+        name: "Ninetales",
+        prices: {
+          market: 2,
+          conditions: {},
+        },
+      },
+    ]);
+
+    const result = await lookupHandler(
+      {
+        fetchPrimaryCards,
+        fetchFallbackCards,
+      },
+      {
+        query: "ninetales",
+        recognizedTexts: ["ninetales"],
+        maxResults: 3,
+        responseSchemaVersion: CARDS_LOOKUP_SCHEMA_VERSION,
+      },
+    );
+
+    expect(fetchPrimaryCards).toHaveBeenCalledTimes(1);
+    expect(fetchFallbackCards).toHaveBeenCalledTimes(1);
+    expect(result.payload.candidates[0]?.id).toBe("base1-6");
   });
 });

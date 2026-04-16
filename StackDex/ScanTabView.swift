@@ -188,6 +188,8 @@ struct ScanTabView: View {
 
             Spacer(minLength: 14)
 
+            zoomControls
+
             Button(action: handleCaptureButtonTap) {
                 Label("Aufnehmen", systemImage: "camera.circle.fill")
                     .font(.headline)
@@ -356,6 +358,65 @@ struct ScanTabView: View {
         }
 
         return false
+    }
+
+    private var canUseZoomControls: Bool {
+        camera.authorizationStatus == .authorized
+        && camera.isSessionRunning
+        && !hasActiveScannerInterruption
+    }
+
+    @ViewBuilder
+    private var zoomControls: some View {
+        if camera.zoomState.isAvailable {
+            HStack(spacing: 10) {
+                ForEach(camera.zoomState.steps, id: \.self) { factor in
+                    let isSelected = abs(camera.zoomState.current - factor) < 0.07
+
+                    Button {
+                        camera.setZoomFactor(factor, animated: true)
+                    } label: {
+                        Text(zoomLabel(for: factor))
+                            .font(.caption.weight(.semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(isSelected ? Color.black : Color.white)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(isSelected ? Color.white : Color.white.opacity(0.22))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(!canUseZoomControls)
+                    .accessibilityIdentifier("scan.shell.zoom.\(zoomIdentifier(for: factor))")
+                    .accessibilityValue(isSelected ? "Ausgewaehlt" : "Nicht ausgewaehlt")
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(.black.opacity(0.28))
+            )
+            .transition(.opacity)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("scan.shell.zoom.controls")
+        }
+    }
+
+    private func zoomLabel(for factor: CGFloat) -> String {
+        let rounded = (factor * 10).rounded() / 10
+        if abs(rounded.rounded() - rounded) < 0.05 {
+            return "\(Int(rounded))x"
+        }
+
+        return "\(String(format: "%.1f", rounded))x"
+    }
+
+    private func zoomIdentifier(for factor: CGFloat) -> String {
+        let label = zoomLabel(for: factor)
+        return label.replacingOccurrences(of: ".", with: "_")
     }
 
     private var accessorySummary: String {
@@ -1005,6 +1066,21 @@ private struct CameraPreviewView: UIViewRepresentable {
                 camera.focusAndExpose(atPreviewPoint: point)
             }
         }
+        view.pinchHandler = { state, scale in
+            Task { @MainActor in
+                switch state {
+                case .began:
+                    camera.beginPinchZoom()
+                    camera.updatePinchZoom(scale: scale)
+                case .changed:
+                    camera.updatePinchZoom(scale: scale)
+                case .ended, .cancelled, .failed:
+                    camera.endPinchZoom()
+                default:
+                    break
+                }
+            }
+        }
         camera.attachPreviewLayer(view.previewLayer)
         return view
     }
@@ -1014,6 +1090,21 @@ private struct CameraPreviewView: UIViewRepresentable {
         uiView.tapHandler = { point in
             Task { @MainActor in
                 camera.focusAndExpose(atPreviewPoint: point)
+            }
+        }
+        uiView.pinchHandler = { state, scale in
+            Task { @MainActor in
+                switch state {
+                case .began:
+                    camera.beginPinchZoom()
+                    camera.updatePinchZoom(scale: scale)
+                case .changed:
+                    camera.updatePinchZoom(scale: scale)
+                case .ended, .cancelled, .failed:
+                    camera.endPinchZoom()
+                default:
+                    break
+                }
             }
         }
         camera.attachPreviewLayer(uiView.previewLayer)
@@ -1036,6 +1127,7 @@ private struct CameraPreviewView: UIViewRepresentable {
 
     final class PreviewView: UIView {
         var tapHandler: ((CGPoint) -> Void)?
+        var pinchHandler: ((UIGestureRecognizer.State, CGFloat) -> Void)?
 
         override class var layerClass: AnyClass {
             AVCaptureVideoPreviewLayer.self
@@ -1044,7 +1136,9 @@ private struct CameraPreviewView: UIViewRepresentable {
         override init(frame: CGRect) {
             super.init(frame: frame)
             let tapRecognizer = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+            let pinchRecognizer = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
             addGestureRecognizer(tapRecognizer)
+            addGestureRecognizer(pinchRecognizer)
         }
 
         required init?(coder: NSCoder) {
@@ -1057,11 +1151,16 @@ private struct CameraPreviewView: UIViewRepresentable {
 
         func prepareForTeardown() {
             tapHandler = nil
+            pinchHandler = nil
             previewLayer.session = nil
         }
 
         @objc private func handleTap(_ recognizer: UITapGestureRecognizer) {
             tapHandler?(recognizer.location(in: self))
+        }
+
+        @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {
+            pinchHandler?(recognizer.state, recognizer.scale)
         }
     }
 }

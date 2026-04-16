@@ -12,8 +12,13 @@ import type * as cards from "../cards.js";
 import type * as lib_cardsLookupContract from "../lib/cardsLookupContract.js";
 import type * as lib_pokewalletErrors from "../lib/pokewalletErrors.js";
 import type * as lib_pokewalletNormalizer from "../lib/pokewalletNormalizer.js";
+import type * as lib_pokewalletQueryNormalizer from "../lib/pokewalletQueryNormalizer.js";
 import type * as lib_pokewalletTypes from "../lib/pokewalletTypes.js";
+import type * as lib_tcgdexErrors from "../lib/tcgdexErrors.js";
+import type * as lib_tcgdexNormalizer from "../lib/tcgdexNormalizer.js";
+import type * as lib_tcgdexTypes from "../lib/tcgdexTypes.js";
 import type * as pokewallet from "../pokewallet.js";
+import type * as tcgdex from "../tcgdex.js";
 
 import type {
   ApiFromModules,
@@ -26,8 +31,13 @@ declare const fullApi: ApiFromModules<{
   "lib/cardsLookupContract": typeof lib_cardsLookupContract;
   "lib/pokewalletErrors": typeof lib_pokewalletErrors;
   "lib/pokewalletNormalizer": typeof lib_pokewalletNormalizer;
+  "lib/pokewalletQueryNormalizer": typeof lib_pokewalletQueryNormalizer;
   "lib/pokewalletTypes": typeof lib_pokewalletTypes;
+  "lib/tcgdexErrors": typeof lib_tcgdexErrors;
+  "lib/tcgdexNormalizer": typeof lib_tcgdexNormalizer;
+  "lib/tcgdexTypes": typeof lib_tcgdexTypes;
   pokewallet: typeof pokewallet;
+  tcgdex: typeof tcgdex;
 }>;
 
 /**

@@ -84,28 +84,137 @@ describe("pokewallet upstream integration", () => {
     ]);
   });
 
+  it("retries with normalized query when the first response is empty", async () => {
+    process.env.POKEWALLET_API_KEY = "pk_live_test";
+    process.env.POKEWALLET_BASE_URL = "https://api.pokewallet.io";
+
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            results: [],
+          }),
+          {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+            },
+          },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            results: [
+              {
+                id: "pk_456",
+                card_info: {
+                  name: "Mega Gengar ex",
+                  card_number: "56/094",
+                  set_code: "PFL",
+                },
+              },
+            ],
+          }),
+          {
+            status: 200,
+            headers: {
+              "Content-Type": "application/json",
+            },
+          },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchSpy as unknown as typeof fetch);
+
+    const result = await fetchPokewalletCandidates({
+      query: "Mega-Gengar ex",
+      recognizedTexts: ["Mega-Gengar ex"],
+      maxResults: 3,
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+    const [firstUrl] = fetchSpy.mock.calls[0] as [RequestInfo | URL, RequestInit];
+    const firstParsedUrl = new URL(
+      typeof firstUrl === "string" ? firstUrl : firstUrl instanceof URL ? firstUrl.toString() : firstUrl.url,
+    );
+    expect(firstParsedUrl.searchParams.get("q")).toBe("Mega-Gengar ex");
+
+    const [secondUrl] = fetchSpy.mock.calls[1] as [RequestInfo | URL, RequestInit];
+    const secondParsedUrl = new URL(
+      typeof secondUrl === "string" ? secondUrl : secondUrl instanceof URL ? secondUrl.toString() : secondUrl.url,
+    );
+    expect(secondParsedUrl.searchParams.get("q")).toBe("mega gengar ex");
+
+    expect(result).toEqual([
+      {
+        id: "pk_456",
+        name: "Mega Gengar ex",
+        number: "56/094",
+        setCode: "PFL",
+        prices: {
+          market: 0,
+          conditions: {},
+        },
+      },
+    ]);
+  });
+
+  it("does not issue a fallback request when query is already normalized", async () => {
+    process.env.POKEWALLET_API_KEY = "pk_live_test";
+    process.env.POKEWALLET_BASE_URL = "https://api.pokewallet.io";
+
+    const fetchSpy = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          results: [],
+        }),
+        {
+          status: 200,
+          headers: {
+            "Content-Type": "application/json",
+          },
+        },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchSpy as unknown as typeof fetch);
+
+    const result = await fetchPokewalletCandidates({
+      query: "pikachu ex",
+      recognizedTexts: ["pikachu ex"],
+      maxResults: 3,
+    });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(result).toEqual([]);
+  });
+
   it("surfaces upstream HTTP status errors", async () => {
     process.env.POKEWALLET_API_KEY = "pk_live_test";
     process.env.POKEWALLET_BASE_URL = "https://api.pokewallet.io";
 
+    const fetchSpy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ error: "Unauthorized" }), {
+        status: 401,
+        headers: {
+          "Content-Type": "application/json",
+        },
+      }),
+    );
+
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue(
-        new Response(JSON.stringify({ error: "Unauthorized" }), {
-          status: 401,
-          headers: {
-            "Content-Type": "application/json",
-          },
-        }),
-      ) as unknown as typeof fetch,
+      fetchSpy as unknown as typeof fetch,
     );
 
     await expect(
       fetchPokewalletCandidates({
-        query: "charizard",
-        recognizedTexts: ["charizard"],
+        query: "Mega-Gengar ex",
+        recognizedTexts: ["Mega-Gengar ex"],
         maxResults: 3,
       }),
     ).rejects.toBeInstanceOf(PokewalletUpstreamError);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 });

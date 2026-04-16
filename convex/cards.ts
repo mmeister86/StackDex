@@ -44,20 +44,32 @@ export type LookupArgs = {
 
 export async function lookupHandler(
   deps: {
-    fetchCards: (args: PokewalletLookupArgs) => Promise<CardCandidate[]>;
+    fetchPrimaryCards: (args: PokewalletLookupArgs) => Promise<CardCandidate[]>;
+    fetchFallbackCards: (args: PokewalletLookupArgs) => Promise<CardCandidate[]>;
   },
   args: LookupArgs,
 ) {
   assertCardsLookupSchemaVersion(args.responseSchemaVersion);
 
-  const candidates = await deps.fetchCards({
+  const lookupArgs = {
     recognizedTexts: args.recognizedTexts,
     query: args.query,
     maxResults: args.maxResults,
     hints: args.hints,
-  });
+  };
 
-  return buildCardsLookupEnvelope(candidates);
+  try {
+    const primaryCandidates = await deps.fetchPrimaryCards(lookupArgs);
+    if (primaryCandidates.length > 0) {
+      return buildCardsLookupEnvelope(primaryCandidates);
+    }
+  } catch {
+    // Intentionally ignored so we can fall back to the secondary provider.
+  }
+
+  const fallbackCandidates = await deps.fetchFallbackCards(lookupArgs);
+
+  return buildCardsLookupEnvelope(fallbackCandidates);
 }
 
 export const lookup = actionGeneric({
@@ -65,7 +77,13 @@ export const lookup = actionGeneric({
   handler: async (ctx, args) => {
     return lookupHandler(
       {
-        fetchCards: async (lookupArgs) => {
+        fetchPrimaryCards: async (lookupArgs) => {
+          return (ctx.runAction as unknown as (path: string, actionArgs: PokewalletLookupArgs) => Promise<CardCandidate[]>)(
+            "tcgdex:fetchCards",
+            lookupArgs,
+          );
+        },
+        fetchFallbackCards: async (lookupArgs) => {
           return (ctx.runAction as unknown as (path: string, actionArgs: PokewalletLookupArgs) => Promise<CardCandidate[]>)(
             "pokewallet:fetchCards",
             lookupArgs,

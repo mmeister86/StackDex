@@ -32,9 +32,27 @@ final class CameraCaptureService: NSObject, ObservableObject {
         case captureFailed
     }
 
+    struct ZoomState: Equatable {
+        let current: CGFloat
+        let min: CGFloat
+        let max: CGFloat
+        let steps: [CGFloat]
+        let isAvailable: Bool
+
+        static let unavailable = ZoomState(
+            current: 1,
+            min: 1,
+            max: 1,
+            steps: [1],
+            isAvailable: false
+        )
+    }
+
     @Published private(set) var authorizationStatus: AVAuthorizationStatus
     @Published private(set) var focusIndicatorState: FocusIndicatorState = .idle
     @Published private(set) var interruptionState: SessionInterruptionState = .none
+    @Published private(set) var zoomState: ZoomState = .unavailable
+    @Published private(set) var isSessionRunning = false
     let session = AVCaptureSession()
 
     private let sessionQueue = DispatchQueue(label: "stackdex.camera.session")
@@ -50,6 +68,9 @@ final class CameraCaptureService: NSObject, ObservableObject {
     private var subjectAreaDidChangeObserver: NSObjectProtocol?
     private var autoFocusRecenterWorkItem: DispatchWorkItem?
     private var focusResetTask: Task<Void, Never>?
+    private var zoomRange: ClosedRange<CGFloat> = 1 ... 1
+    private var zoomSteps: [CGFloat] = [1]
+    private var pinchBaseZoomFactor: CGFloat?
 
     override init() {
         authorizationStatus = AVCaptureDevice.authorizationStatus(for: .video)
@@ -92,6 +113,9 @@ final class CameraCaptureService: NSObject, ObservableObject {
         sessionQueue.async { [weak self] in
             guard let self, !self.session.isRunning else { return }
             self.session.startRunning()
+            Task { @MainActor in
+                self.isSessionRunning = true
+            }
         }
     }
 
@@ -99,6 +123,9 @@ final class CameraCaptureService: NSObject, ObservableObject {
         sessionQueue.async { [weak self] in
             guard let self, self.session.isRunning else { return }
             self.session.stopRunning()
+            Task { @MainActor in
+                self.isSessionRunning = false
+            }
         }
     }
 
@@ -173,6 +200,88 @@ final class CameraCaptureService: NSObject, ObservableObject {
         }
     }
 
+    func setZoomFactor(_ factor: CGFloat, animated: Bool) {
+        guard authorizationStatus == .authorized else { return }
+
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.activeDevice else { return }
+
+            let clamped = min(max(factor, self.zoomRange.lowerBound), self.zoomRange.upperBound)
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+
+                if animated {
+                    let rate: Float = clamped >= device.videoZoomFactor ? 8 : 10
+                    device.ramp(toVideoZoomFactor: clamped, withRate: rate)
+                } else {
+                    if device.isRampingVideoZoom {
+                        device.cancelVideoZoomRamp()
+                    }
+                    device.videoZoomFactor = clamped
+                }
+            } catch {
+                return
+            }
+
+            self.publishZoomState(
+                current: clamped,
+                min: self.zoomRange.lowerBound,
+                max: self.zoomRange.upperBound,
+                steps: self.zoomSteps
+            )
+        }
+    }
+
+    func beginPinchZoom() {
+        guard authorizationStatus == .authorized else { return }
+
+        sessionQueue.async { [weak self] in
+            guard let self, let device = self.activeDevice else { return }
+            self.pinchBaseZoomFactor = device.videoZoomFactor
+        }
+    }
+
+    func updatePinchZoom(scale: CGFloat) {
+        guard authorizationStatus == .authorized else { return }
+
+        sessionQueue.async { [weak self] in
+            guard
+                let self,
+                let device = self.activeDevice,
+                let base = self.pinchBaseZoomFactor
+            else {
+                return
+            }
+
+            let target = min(max(base * scale, self.zoomRange.lowerBound), self.zoomRange.upperBound)
+            do {
+                try device.lockForConfiguration()
+                defer { device.unlockForConfiguration() }
+
+                if device.isRampingVideoZoom {
+                    device.cancelVideoZoomRamp()
+                }
+                device.videoZoomFactor = target
+            } catch {
+                return
+            }
+
+            self.publishZoomState(
+                current: target,
+                min: self.zoomRange.lowerBound,
+                max: self.zoomRange.upperBound,
+                steps: self.zoomSteps
+            )
+        }
+    }
+
+    func endPinchZoom() {
+        sessionQueue.async { [weak self] in
+            self?.pinchBaseZoomFactor = nil
+        }
+    }
+
     func capturePhoto(_ completion: @escaping (Result<UIImage, Error>) -> Void) {
         guard authorizationStatus == .authorized else {
             completion(.failure(CaptureError.captureFailed))
@@ -231,6 +340,7 @@ final class CameraCaptureService: NSObject, ObservableObject {
             self.session.addOutput(self.photoOutput)
             self.photoOutput.maxPhotoQualityPrioritization = .quality
             self.configureDefaultScannerFocusAndExposure(for: camera)
+            self.configureZoom(for: camera)
             self.registerSubjectAreaChangeObserver(for: camera)
             self.configureRotationCoordinatorIfPossible()
             self.registerInterruptionObserversIfNeeded()
@@ -306,9 +416,6 @@ final class CameraCaptureService: NSObject, ObservableObject {
     }
 
     private static func preferredBackCameraDevice() -> AVCaptureDevice? {
-        if let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) {
-            return wide
-        }
         if let triple = AVCaptureDevice.default(.builtInTripleCamera, for: .video, position: .back) {
             return triple
         }
@@ -317,6 +424,9 @@ final class CameraCaptureService: NSObject, ObservableObject {
         }
         if let dual = AVCaptureDevice.default(.builtInDualCamera, for: .video, position: .back) {
             return dual
+        }
+        if let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) {
+            return wide
         }
         return nil
     }
@@ -343,6 +453,7 @@ final class CameraCaptureService: NSObject, ObservableObject {
                 queue: .main
             ) { [weak self] _ in
                 self?.interruptionState = .none
+                self?.isSessionRunning = self?.session.isRunning ?? false
             }
         )
     }
@@ -414,6 +525,52 @@ final class CameraCaptureService: NSObject, ObservableObject {
             self.captureRotationAngle = captureAngle
         }
     }
+
+    private func configureZoom(for device: AVCaptureDevice) {
+        let configuration = CameraZoomConfigurationBuilder.make(
+            minAvailable: device.minAvailableVideoZoomFactor,
+            maxAvailable: device.maxAvailableVideoZoomFactor,
+            switchOverFactors: device.virtualDeviceSwitchOverVideoZoomFactors.map { CGFloat(truncating: $0) }
+        )
+
+        zoomRange = configuration.min ... configuration.max
+        zoomSteps = configuration.steps
+        pinchBaseZoomFactor = nil
+
+        var currentZoomFactor = configuration.defaultZoom
+        do {
+            try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
+
+            if device.isRampingVideoZoom {
+                device.cancelVideoZoomRamp()
+            }
+            device.videoZoomFactor = configuration.defaultZoom
+            currentZoomFactor = device.videoZoomFactor
+        } catch {
+            currentZoomFactor = min(max(device.videoZoomFactor, configuration.min), configuration.max)
+        }
+
+        publishZoomState(
+            current: currentZoomFactor,
+            min: configuration.min,
+            max: configuration.max,
+            steps: configuration.steps
+        )
+    }
+
+    nonisolated private func publishZoomState(current: CGFloat, min: CGFloat, max: CGFloat, steps: [CGFloat]) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.zoomState = ZoomState(
+                current: current,
+                min: min,
+                max: max,
+                steps: steps,
+                isAvailable: steps.count > 1 || (max - min) > 0.05
+            )
+        }
+    }
 }
 
 extension CameraCaptureService: AVCapturePhotoCaptureDelegate {
@@ -444,6 +601,55 @@ extension CameraCaptureService: AVCapturePhotoCaptureDelegate {
             captureHandler = nil
             handler?(result)
         }
+    }
+}
+
+struct CameraZoomConfiguration: Equatable {
+    let min: CGFloat
+    let max: CGFloat
+    let steps: [CGFloat]
+    let defaultZoom: CGFloat
+}
+
+enum CameraZoomConfigurationBuilder {
+    static let maxScannerZoomFactor: CGFloat = 3
+
+    static func make(
+        minAvailable: CGFloat,
+        maxAvailable: CGFloat,
+        switchOverFactors: [CGFloat]
+    ) -> CameraZoomConfiguration {
+        let safeMin = max(1, minAvailable.isFinite ? minAvailable : 1)
+        let clampedMaxInput = max(maxAvailable.isFinite ? maxAvailable : safeMin, safeMin)
+        let safeMax = max(safeMin, min(maxScannerZoomFactor, clampedMaxInput))
+
+        var candidates = [CGFloat](arrayLiteral: 1, 2, 3)
+        candidates.append(contentsOf: switchOverFactors)
+
+        let sorted = candidates
+            .filter { $0.isFinite && $0 > 0 }
+            .map { min(max($0, safeMin), safeMax) }
+            .sorted()
+
+        var deduplicated: [CGFloat] = []
+        for value in sorted {
+            if let last = deduplicated.last, abs(last - value) < 0.01 {
+                continue
+            }
+            deduplicated.append(value)
+        }
+
+        if deduplicated.isEmpty {
+            deduplicated = [safeMin]
+        }
+
+        let defaultZoom = min(max(1, safeMin), safeMax)
+        return CameraZoomConfiguration(
+            min: safeMin,
+            max: safeMax,
+            steps: deduplicated,
+            defaultZoom: defaultZoom
+        )
     }
 }
 #endif
