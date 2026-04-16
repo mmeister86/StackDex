@@ -29,6 +29,9 @@ This document defines the wire contract currently expected by the implemented iO
     - `normalizedQuery` (string)
     - `nameTokens` (array of string)
     - `possibleNumbers` (array of string)
+    - `possibleSetCodes` (array of string)
+    - `possibleRarities` (array of string)
+    - `possibleLanguages` (array of string)
 
 ### Full request example
 
@@ -43,7 +46,10 @@ This document defines the wire contract currently expected by the implemented iO
     "hints": {
       "normalizedQuery": "charizard 4/102",
       "nameTokens": ["charizard"],
-      "possibleNumbers": ["4/102"]
+      "possibleNumbers": ["4/102"],
+      "possibleSetCodes": ["SVI"],
+      "possibleRarities": ["Rare"],
+      "possibleLanguages": ["DE"]
     }
   },
   "format": "json"
@@ -127,6 +133,7 @@ Convex `/api/query` wraps function output in a transport object. For this contra
 - iOS validates `value.schemaVersion` strictly against the requested `args.responseSchemaVersion` (no implicit fallback acceptance).
 - Server returns `schemaVersion` in the function envelope for runtime validation.
 - Additive, backward-compatible changes stay within `cards.lookup.v1` (new optional fields only).
+- Request-side hint extensions (`possibleSetCodes`, `possibleRarities`, `possibleLanguages`) are additive and remain `cards.lookup.v1` compatible.
 - Breaking changes require a new literal (for example `cards.lookup.v2`) with parallel server support.
 - Rollout pattern: dual-serve versions, gate iOS opt-in by config/flag, remove old version only after supported clients migrate.
 

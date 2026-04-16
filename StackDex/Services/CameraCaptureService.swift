@@ -47,6 +47,8 @@ final class CameraCaptureService: NSObject, ObservableObject {
     private var rotationObservation: NSKeyValueObservation?
     private var captureRotationAngle: CGFloat = 0
     private var interruptionObservers: [NSObjectProtocol] = []
+    private var subjectAreaDidChangeObserver: NSObjectProtocol?
+    private var autoFocusRecenterWorkItem: DispatchWorkItem?
     private var focusResetTask: Task<Void, Never>?
 
     override init() {
@@ -60,6 +62,10 @@ final class CameraCaptureService: NSObject, ObservableObject {
 
     deinit {
         interruptionObservers.forEach(NotificationCenter.default.removeObserver)
+        if let subjectAreaDidChangeObserver {
+            NotificationCenter.default.removeObserver(subjectAreaDidChangeObserver)
+        }
+        autoFocusRecenterWorkItem?.cancel()
         focusResetTask?.cancel()
     }
 
@@ -128,21 +134,41 @@ final class CameraCaptureService: NSObject, ObservableObject {
                 try device.lockForConfiguration()
                 defer { device.unlockForConfiguration() }
 
-                if device.isFocusPointOfInterestSupported, device.isFocusModeSupported(.autoFocus) {
+                if device.isFocusPointOfInterestSupported,
+                   device.isFocusModeSupported(.autoFocus) {
                     device.focusPointOfInterest = devicePoint
                     device.focusMode = .autoFocus
+                } else if device.isFocusPointOfInterestSupported,
+                          device.isFocusModeSupported(.continuousAutoFocus) {
+                    device.focusPointOfInterest = devicePoint
+                    device.focusMode = .continuousAutoFocus
                 }
 
-                if device.isExposurePointOfInterestSupported, device.isExposureModeSupported(.autoExpose) {
+                if device.isExposurePointOfInterestSupported,
+                   device.isExposureModeSupported(.autoExpose) {
                     device.exposurePointOfInterest = devicePoint
                     device.exposureMode = .autoExpose
+                } else if device.isExposurePointOfInterestSupported,
+                          device.isExposureModeSupported(.continuousAutoExposure) {
+                    device.exposurePointOfInterest = devicePoint
+                    device.exposureMode = .continuousAutoExposure
                 }
 
+                if device.isAutoFocusRangeRestrictionSupported {
+                    device.autoFocusRangeRestriction = .near
+                }
+                if device.isSmoothAutoFocusSupported {
+                    device.isSmoothAutoFocusEnabled = true
+                }
+                if device.isLowLightBoostSupported {
+                    device.automaticallyEnablesLowLightBoostWhenAvailable = true
+                }
                 device.isSubjectAreaChangeMonitoringEnabled = true
             } catch {
                 return
             }
 
+            self.scheduleAutoFocusRecentering()
             self.publishFocusIndicator(at: previewPoint)
         }
     }
@@ -188,7 +214,7 @@ final class CameraCaptureService: NSObject, ObservableObject {
             self.session.sessionPreset = .photo
 
             guard
-                let camera = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+                let camera = Self.preferredBackCameraDevice(),
                 let input = try? AVCaptureDeviceInput(device: camera),
                 self.session.canAddInput(input)
             else {
@@ -205,6 +231,7 @@ final class CameraCaptureService: NSObject, ObservableObject {
             self.session.addOutput(self.photoOutput)
             self.photoOutput.maxPhotoQualityPrioritization = .quality
             self.configureDefaultScannerFocusAndExposure(for: camera)
+            self.registerSubjectAreaChangeObserver(for: camera)
             self.configureRotationCoordinatorIfPossible()
             self.registerInterruptionObserversIfNeeded()
         }
@@ -224,6 +251,12 @@ final class CameraCaptureService: NSObject, ObservableObject {
             } else if device.isFocusModeSupported(.continuousAutoFocus) {
                 device.focusMode = .continuousAutoFocus
             }
+            if device.isAutoFocusRangeRestrictionSupported {
+                device.autoFocusRangeRestriction = .near
+            }
+            if device.isSmoothAutoFocusSupported {
+                device.isSmoothAutoFocusEnabled = true
+            }
 
             if device.isExposurePointOfInterestSupported,
                device.isExposureModeSupported(.continuousAutoExposure) {
@@ -232,11 +265,60 @@ final class CameraCaptureService: NSObject, ObservableObject {
             } else if device.isExposureModeSupported(.continuousAutoExposure) {
                 device.exposureMode = .continuousAutoExposure
             }
+            if device.isLowLightBoostSupported {
+                device.automaticallyEnablesLowLightBoostWhenAvailable = true
+            }
 
             device.isSubjectAreaChangeMonitoringEnabled = true
         } catch {
             return
         }
+    }
+
+    private func registerSubjectAreaChangeObserver(for device: AVCaptureDevice) {
+        if let subjectAreaDidChangeObserver {
+            NotificationCenter.default.removeObserver(subjectAreaDidChangeObserver)
+        }
+
+        subjectAreaDidChangeObserver = NotificationCenter.default.addObserver(
+            forName: .AVCaptureDeviceSubjectAreaDidChange,
+            object: device,
+            queue: nil
+        ) { [weak self] _ in
+            self?.sessionQueue.async { [weak self] in
+                self?.recenterFocusAndExposureIfPossible()
+            }
+        }
+    }
+
+    private func scheduleAutoFocusRecentering() {
+        autoFocusRecenterWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.recenterFocusAndExposureIfPossible()
+        }
+        autoFocusRecenterWorkItem = workItem
+        sessionQueue.asyncAfter(deadline: .now() + 1.1, execute: workItem)
+    }
+
+    private func recenterFocusAndExposureIfPossible() {
+        guard let activeDevice else { return }
+        configureDefaultScannerFocusAndExposure(for: activeDevice)
+    }
+
+    private static func preferredBackCameraDevice() -> AVCaptureDevice? {
+        if let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) {
+            return wide
+        }
+        if let triple = AVCaptureDevice.default(.builtInTripleCamera, for: .video, position: .back) {
+            return triple
+        }
+        if let dualWide = AVCaptureDevice.default(.builtInDualWideCamera, for: .video, position: .back) {
+            return dualWide
+        }
+        if let dual = AVCaptureDevice.default(.builtInDualCamera, for: .video, position: .back) {
+            return dual
+        }
+        return nil
     }
 
     private func registerInterruptionObserversIfNeeded() {

@@ -119,6 +119,71 @@ describe("pokewallet normalizer", () => {
     ]);
   });
 
+  it("normalizes current /search payload with nested card_info and tcgplayer pricing", () => {
+    const candidates = normalizePokewalletLookupResponse({
+      query: "pikachu",
+      results: [
+        {
+          id: "pk_7204",
+          card_info: {
+            name: "Pikachu ex (Pikachu 60)",
+            set_code: "BA2024",
+            card_number: "106",
+            rarity: "Holo Rare",
+          },
+          tcgplayer: {
+            prices: [
+              {
+                sub_type_name: "Normal",
+                market_price: 8.01,
+              },
+            ],
+          },
+        },
+      ],
+    });
+
+    expect(candidates).toEqual([
+      {
+        id: "pk_7204",
+        name: "Pikachu ex (Pikachu 60)",
+        number: "106",
+        rarity: "Holo Rare",
+        setCode: "BA2024",
+        prices: {
+          market: 8.01,
+          conditions: {},
+        },
+      },
+    ]);
+  });
+
+  it("keeps candidates without image URL", () => {
+    const candidates = normalizePokewalletLookupResponse({
+      results: [
+        {
+          id: "pk_noimage",
+          card_info: {
+            name: "No Image Card",
+            card_number: "1",
+          },
+        },
+      ],
+    });
+
+    expect(candidates).toEqual([
+      {
+        id: "pk_noimage",
+        name: "No Image Card",
+        number: "1",
+        prices: {
+          market: 0,
+          conditions: {},
+        },
+      },
+    ]);
+  });
+
   it("returns empty array for malformed payload", () => {
     expect(normalizePokewalletLookupResponse({ invalid: true })).toEqual([]);
     expect(normalizePokewalletLookupResponse(null)).toEqual([]);

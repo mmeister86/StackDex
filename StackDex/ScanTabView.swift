@@ -15,6 +15,7 @@ struct ScanTabView: View {
     @State private var isProcessing = false
     @State private var scanOutcome = ScanResultPolicy.Outcome(state: .noMatch, candidates: [])
     @State private var lastHints = ScanLookupHints(normalizedQuery: "", nameTokens: [], possibleNumbers: [])
+    @State private var lastLookupAttempts: [ScanLookupAttempt] = []
     @State private var lastPipelineResult: ScanPipelineResult?
     @State private var selectedCandidateID: String?
     @State private var quantity: Int = 1
@@ -397,7 +398,7 @@ struct ScanTabView: View {
 
             #if DEBUG
             if let lastPipelineResult {
-                debugPanel(for: lastPipelineResult)
+                debugPanel(for: lastPipelineResult, attempts: lastLookupAttempts)
             }
             #endif
         }
@@ -570,6 +571,7 @@ struct ScanTabView: View {
         isProcessing = true
         errorMessage = nil
         infoMessage = nil
+        lastLookupAttempts = []
         lastPipelineResult = nil
 
         do {
@@ -581,11 +583,23 @@ struct ScanTabView: View {
                 appendInfoMessage("Kartenrahmen nicht sicher erkannt. Vollbild-Fallback wurde verwendet.")
             }
 
+            if pipelineResult.usedFullImageFallback && !pipelineResult.hints.hasStrongLookupSignal {
+                logger.info("Scan aborted due to weak fallback-only OCR signals")
+                scanOutcome = .init(state: .noMatch, candidates: [])
+                selectedCandidateID = nil
+                appendInfoMessage("Scan verworfen: kein verlässlicher Name oder keine Sammlernummer erkannt.")
+                errorMessage = "Kein verlässlicher Treffer. Bitte Karte vollständig und frontal im Rahmen platzieren."
+                isResultSheetPresented = true
+                isProcessing = false
+                return
+            }
+
             guard !pipelineResult.recognizedFields.isEmpty,
                   !pipelineResult.hints.normalizedQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 logger.info("OCR produced no high-confidence fields")
                 scanOutcome = .init(state: .noMatch, candidates: [])
                 selectedCandidateID = nil
+                appendInfoMessage("Unsichere OCR-Treffer wurden konservativ verworfen.")
                 errorMessage = "Es konnten keine verlässlichen Kartenfelder erkannt werden."
                 isResultSheetPresented = true
                 isProcessing = false
@@ -600,6 +614,7 @@ struct ScanTabView: View {
                     maxResults: 3
                 )
             )
+            lastLookupAttempts = lookupResponse.attempts
 
             let outcome = ScanResultPolicy.evaluate(candidates: lookupResponse.candidates, maxCandidates: 3)
             applyLookupOutcome(outcome, hints: pipelineResult.hints, lookupResponse: lookupResponse)
@@ -618,6 +633,7 @@ struct ScanTabView: View {
         isManualSearchFocused = false
         errorMessage = nil
         infoMessage = nil
+        lastLookupAttempts = []
         lastPipelineResult = nil
 
         let query = manualSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -630,6 +646,13 @@ struct ScanTabView: View {
         let candidates = await lookupService.lookupCandidates(
             for: CardLookupRequest(recognizedTexts: [query], query: query, hints: hints, maxResults: 3)
         )
+        lastLookupAttempts = [
+            ScanLookupAttempt(
+                strategy: .structuredNameOnly,
+                query: query,
+                candidateCount: candidates.count
+            ),
+        ]
         let outcome = ScanResultPolicy.evaluate(candidates: candidates, maxCandidates: 3)
         applyLookupOutcome(outcome, hints: hints, lookupResponse: nil)
         isProcessing = false
@@ -861,12 +884,21 @@ struct ScanTabView: View {
 
     #if DEBUG
     @ViewBuilder
-    private func debugPanel(for result: ScanPipelineResult) -> some View {
+    private func debugPanel(for result: ScanPipelineResult, attempts: [ScanLookupAttempt]) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Debug")
                 .font(.caption.weight(.semibold))
             Text("Query: \(result.hints.normalizedQuery.isEmpty ? "-" : result.hints.normalizedQuery)")
                 .font(.caption2)
+            Text("Set-Codes: \(result.hints.possibleSetCodes.isEmpty ? "-" : result.hints.possibleSetCodes.joined(separator: ", "))")
+                .font(.caption2)
+            Text("Rarity: \(result.hints.possibleRarities.isEmpty ? "-" : result.hints.possibleRarities.joined(separator: ", "))")
+                .font(.caption2)
+            Text("Language: \(result.hints.possibleLanguages.isEmpty ? "-" : result.hints.possibleLanguages.joined(separator: ", "))")
+                .font(.caption2)
+            Text("Strategy: \(attempts.last?.strategy.rawValue ?? "-")")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             ForEach(Array(result.recognizedFields.prefix(3).enumerated()), id: \.offset) { _, field in
                 Text("\(field.region.rawValue): \(field.text) (\(Int(field.confidence * 100))%)")
                     .font(.caption2)

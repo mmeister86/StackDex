@@ -4,7 +4,7 @@ import {
   type CardConditionKey,
   type PriceValue,
 } from "./cardsLookupContract";
-import type { PokewalletCardLike, PokewalletLookupResponse } from "./pokewalletTypes";
+import type { PokewalletCardLike, PokewalletLookupResponse, PokewalletProviderPrice } from "./pokewalletTypes";
 
 const CONDITION_ALIASES: Record<string, CardConditionKey> = {
   mint: "mint",
@@ -83,6 +83,10 @@ function normalizeConditionKey(input: string): CardConditionKey | null {
 }
 
 function extractCards(response: unknown): PokewalletCardLike[] {
+  if (Array.isArray(response)) {
+    return response as PokewalletCardLike[];
+  }
+
   const record = toRecord(response) as PokewalletLookupResponse | null;
   if (!record) {
     return [];
@@ -103,14 +107,61 @@ function extractCards(response: unknown): PokewalletCardLike[] {
   return [];
 }
 
+function extractProviderPrices(value: unknown): PokewalletProviderPrice[] {
+  const record = toRecord(value);
+  if (!record || !Array.isArray(record.prices)) {
+    return [];
+  }
+
+  return record.prices.filter((entry) => toRecord(entry) !== null) as PokewalletProviderPrice[];
+}
+
+function pickMarketFromProviderPrices(cardRecord: Record<string, unknown>): PriceValue | null {
+  const providerPrices = [...extractProviderPrices(cardRecord.tcgplayer), ...extractProviderPrices(cardRecord.cardmarket)];
+
+  for (const price of providerPrices) {
+    const providerPriceRecord = toRecord(price) ?? {};
+    const candidate = toPriceValue(
+      price.market_price ??
+        price.mid_price ??
+        providerPriceRecord.low ??
+        price.low_price ??
+        price.avg ??
+        price.avg30 ??
+        price.trend,
+    );
+
+    if (candidate !== null) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
 function normalizeCard(card: PokewalletCardLike): CardCandidate | null {
   const cardRecord = toRecord(card) ?? {};
+  const cardInfo = toRecord(cardRecord.card_info) ?? toRecord(cardRecord.cardInfo) ?? {};
   const setRecord = toRecord(cardRecord.set) ?? {};
-  const imageRecord = toRecord(cardRecord.image) ?? {};
+  const imageRecord = toRecord(cardRecord.image) ?? toRecord(cardInfo.image) ?? {};
 
-  const id = pickFirstStringField(card.id, cardRecord.cardId, cardRecord.card_id);
-  const name = pickFirstStringField(card.name, cardRecord.cardName, cardRecord.card_name, cardRecord.title);
-  const number = pickFirstStringField(card.number, cardRecord.no, cardRecord.cardNumber, cardRecord.card_number);
+  const id = pickFirstStringField(card.id, cardRecord.cardId, cardRecord.card_id, cardInfo.id, cardInfo.card_id);
+  const name = pickFirstStringField(
+    card.name,
+    cardRecord.cardName,
+    cardRecord.card_name,
+    cardRecord.title,
+    cardInfo.name,
+    cardInfo.clean_name,
+  );
+  const number = pickFirstStringField(
+    card.number,
+    cardRecord.no,
+    cardRecord.cardNumber,
+    cardRecord.card_number,
+    cardInfo.card_number,
+    cardInfo.number,
+  );
   const imageUrl = pickFirstStringField(
     card.imageUrl,
     card.image_url,
@@ -118,11 +169,20 @@ function normalizeCard(card: PokewalletCardLike): CardCandidate | null {
     imageRecord.url,
     imageRecord.small,
     imageRecord.large,
+    cardInfo.image_url,
   );
-  const rarity = pickFirstStringField(card.rarity, cardRecord.rarityLabel, cardRecord.rarity_label);
-  const setCode = pickFirstStringField(card.setCode, card.set_code, setRecord.code, setRecord.id, setRecord.setCode);
+  const rarity = pickFirstStringField(card.rarity, cardRecord.rarityLabel, cardRecord.rarity_label, cardInfo.rarity);
+  const setCode = pickFirstStringField(
+    card.setCode,
+    card.set_code,
+    setRecord.code,
+    setRecord.id,
+    setRecord.setCode,
+    cardInfo.set_code,
+    cardInfo.set_id,
+  );
 
-  if (!id || !name || !number || !imageUrl || !rarity || !setCode) {
+  if (!id || !name) {
     return null;
   }
 
@@ -143,20 +203,31 @@ function normalizeCard(card: PokewalletCardLike): CardCandidate | null {
     }
   }
 
-  const market = toPriceValue(prices?.market ?? card.market) ?? 0;
+  const market = toPriceValue(prices?.market ?? card.market) ?? pickMarketFromProviderPrices(cardRecord) ?? 0;
 
-  return {
+  const candidate: CardCandidate = {
     id,
     name,
-    number,
-    imageUrl,
-    rarity,
-    setCode,
     prices: {
       market,
       conditions,
     },
   };
+
+  if (number) {
+    candidate.number = number;
+  }
+  if (imageUrl) {
+    candidate.imageUrl = imageUrl;
+  }
+  if (rarity) {
+    candidate.rarity = rarity;
+  }
+  if (setCode) {
+    candidate.setCode = setCode;
+  }
+
+  return candidate;
 }
 
 export function normalizePokewalletLookupResponse(response: unknown): CardCandidate[] {

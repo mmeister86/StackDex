@@ -70,6 +70,9 @@ describe("cards.lookup action handler", () => {
           normalizedQuery: "charizard 4/102",
           nameTokens: ["charizard"],
           possibleNumbers: ["4/102"],
+          possibleSetCodes: ["base1"],
+          possibleRarities: ["Holo Rare"],
+          possibleLanguages: ["EN"],
         },
       },
     );
@@ -82,6 +85,9 @@ describe("cards.lookup action handler", () => {
         normalizedQuery: "charizard 4/102",
         nameTokens: ["charizard"],
         possibleNumbers: ["4/102"],
+        possibleSetCodes: ["base1"],
+        possibleRarities: ["Holo Rare"],
+        possibleLanguages: ["EN"],
       },
     });
   });

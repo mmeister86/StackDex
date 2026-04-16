@@ -15,10 +15,10 @@ export type PriceValue = number | string;
 export type CardCandidate = {
   id: string;
   name: string;
-  number: string;
-  imageUrl: string;
-  rarity: string;
-  setCode: string;
+  number?: string;
+  imageUrl?: string;
+  rarity?: string;
+  setCode?: string;
   prices: {
     market: PriceValue;
     conditions: Partial<Record<CardConditionKey, PriceValue>>;

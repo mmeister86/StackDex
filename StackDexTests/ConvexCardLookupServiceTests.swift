@@ -402,7 +402,10 @@ struct ConvexCardLookupServiceTests {
             hints: ScanLookupHints(
                 normalizedQuery: "Pikachu ex 199/091",
                 nameTokens: ["Pikachu", "ex"],
-                possibleNumbers: ["199/091"]
+                possibleNumbers: ["199/091"],
+                possibleSetCodes: ["SVI"],
+                possibleRarities: ["Illustration Rare"],
+                possibleLanguages: ["DE"]
             ),
             maxResults: 3
         )
@@ -416,6 +419,9 @@ struct ConvexCardLookupServiceTests {
         #expect(query == "Pikachu ex")
         #expect(recognizedTexts == ["Pikachu ex", "199/091", "Thunderbolt charge"])
         #expect(hints["normalizedQuery"] as? String == "Pikachu ex 199/091")
+        #expect(hints["possibleSetCodes"] as? [String] == ["SVI"])
+        #expect(hints["possibleRarities"] as? [String] == ["Illustration Rare"])
+        #expect(hints["possibleLanguages"] as? [String] == ["DE"])
     }
 
     @Test func lookupCallsConvexActionTransportEndpoint() async throws {
@@ -589,7 +595,57 @@ struct ConvexCardLookupServiceTests {
 
         #expect(recordedQueries.first == "Pikachu ex")
         #expect(Set(recordedQueries).count == recordedQueries.count)
-        #expect(recordedQueries.count <= 3)
+        #expect(recordedQueries.count <= 4)
+        #expect(result.candidates.isEmpty)
+    }
+
+    @Test func progressiveScanLookupPrioritizesNameNumberSetCodeWhenAvailable() async {
+        let service = RecordingLookupService(
+            responses: [
+                "Pikachu ex 199/091 SVI": [],
+                "Pikachu ex 199/091": [],
+                "Pikachu ex SVI": [],
+                "Pikachu ex": [],
+            ]
+        )
+        let progressive = ProgressiveScanLookupService(base: service)
+
+        let _ = await progressive.lookupScanCandidates(
+            for: CardLookupRequest(
+                recognizedTexts: ["Pikachu ex", "SVI", "199/091"],
+                hints: ScanLookupHints(
+                    normalizedQuery: "Pikachu ex 199/091 SVI",
+                    nameTokens: ["Pikachu", "ex"],
+                    possibleNumbers: ["199/091"],
+                    possibleSetCodes: ["SVI"]
+                ),
+                maxResults: 3
+            )
+        )
+
+        let recordedQueries = await service.recordedQueries
+        #expect(recordedQueries == ["Pikachu ex 199/091 SVI", "Pikachu ex 199/091", "Pikachu ex SVI", "Pikachu ex"])
+    }
+
+    @Test func progressiveScanLookupSkipsFallbackForWeakSignals() async {
+        let service = RecordingLookupService(responses: [:])
+        let progressive = ProgressiveScanLookupService(base: service)
+
+        let result = await progressive.lookupScanCandidates(
+            for: CardLookupRequest(
+                recognizedTexts: ["24SE2", "230", "nimmt jener Spieler"],
+                hints: ScanLookupHints(
+                    normalizedQuery: "24SE2 230",
+                    nameTokens: [],
+                    possibleNumbers: ["230"]
+                ),
+                maxResults: 3
+            )
+        )
+
+        let recordedQueries = await service.recordedQueries
+        #expect(recordedQueries.isEmpty)
+        #expect(result.attempts.isEmpty)
         #expect(result.candidates.isEmpty)
     }
 

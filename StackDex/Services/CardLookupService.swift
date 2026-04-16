@@ -64,7 +64,9 @@ struct CardLookupRequest {
 
 struct ScanLookupAttempt: Equatable, Sendable {
     enum Strategy: String, Equatable, Sendable {
+        case structuredNameNumberSetCode
         case structuredNameAndNumber
+        case structuredNameAndSetCode
         case structuredNameOnly
         case rankedOCRTokens
     }
@@ -134,12 +136,16 @@ struct ProgressiveScanLookupService: ScanLookupServing {
     private func buildAttemptQueries(for request: CardLookupRequest) -> [(ScanLookupAttempt.Strategy, String)] {
         var orderedQueries: [(ScanLookupAttempt.Strategy, String)] = []
         var seen: Set<String> = []
+        let hasStrongSignal = request.hints?.hasStrongLookupSignal ?? false
 
         let trimmedName = request.hints
             .map { $0.nameTokens.joined(separator: " ") }
             .map { $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) }
             .flatMap { $0.nilIfEmpty }
         let trimmedNumber = request.hints?.possibleNumbers.first
+            .map { $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) }
+            .flatMap { $0.nilIfEmpty }
+        let trimmedSetCode = request.hints?.possibleSetCodes.first
             .map { $0.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines) }
             .flatMap { $0.nilIfEmpty }
         let structuredQuery = request.query ?? request.hints
@@ -151,21 +157,36 @@ struct ProgressiveScanLookupService: ScanLookupServing {
             .filter { !$0.isEmpty }
         let fallbackQuery = deduplicated(rankedTokens).prefix(4).joined(separator: " ").nilIfEmpty
 
-        if let structuredQuery {
-            appendQuery(structuredQuery, strategy: .structuredNameAndNumber, to: &orderedQueries, seen: &seen)
-        } else if let trimmedName, let trimmedNumber {
+        if let trimmedName, let trimmedNumber, let trimmedSetCode {
+            appendQuery(
+                "\(trimmedName) \(trimmedNumber) \(trimmedSetCode)",
+                strategy: .structuredNameNumberSetCode,
+                to: &orderedQueries,
+                seen: &seen
+            )
+        }
+
+        if let trimmedName, let trimmedNumber {
             appendQuery("\(trimmedName) \(trimmedNumber)", strategy: .structuredNameAndNumber, to: &orderedQueries, seen: &seen)
+        }
+
+        if let trimmedName, let trimmedSetCode {
+            appendQuery("\(trimmedName) \(trimmedSetCode)", strategy: .structuredNameAndSetCode, to: &orderedQueries, seen: &seen)
         }
 
         if let trimmedName {
             appendQuery(trimmedName, strategy: .structuredNameOnly, to: &orderedQueries, seen: &seen)
         }
 
-        if let fallbackQuery {
+        if hasStrongSignal, orderedQueries.isEmpty, let structuredQuery {
+            appendQuery(structuredQuery, strategy: .structuredNameOnly, to: &orderedQueries, seen: &seen)
+        }
+
+        if hasStrongSignal, let fallbackQuery {
             appendQuery(fallbackQuery, strategy: .rankedOCRTokens, to: &orderedQueries, seen: &seen)
         }
 
-        return Array(orderedQueries.prefix(3))
+        return Array(orderedQueries.prefix(4))
     }
 
     private func deduplicated(_ values: [String]) -> [String] {
@@ -364,6 +385,9 @@ struct ConvexCardLookupService: CardLookupServing {
                 "normalizedQuery": hints.normalizedQuery,
                 "nameTokens": hints.nameTokens,
                 "possibleNumbers": hints.possibleNumbers,
+                "possibleSetCodes": hints.possibleSetCodes,
+                "possibleRarities": hints.possibleRarities,
+                "possibleLanguages": hints.possibleLanguages,
             ]
         }
 

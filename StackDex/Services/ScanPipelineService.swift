@@ -29,6 +29,37 @@ struct ScanLookupHints: Equatable {
     let normalizedQuery: String
     let nameTokens: [String]
     let possibleNumbers: [String]
+    let possibleSetCodes: [String]
+    let possibleRarities: [String]
+    let possibleLanguages: [String]
+
+    var hasNameSignal: Bool {
+        !nameTokens.isEmpty
+    }
+
+    var hasCollectorNumberSignal: Bool {
+        possibleNumbers.contains(where: { $0.contains("/") })
+    }
+
+    var hasStrongLookupSignal: Bool {
+        hasNameSignal || hasCollectorNumberSignal
+    }
+
+    init(
+        normalizedQuery: String,
+        nameTokens: [String],
+        possibleNumbers: [String],
+        possibleSetCodes: [String] = [],
+        possibleRarities: [String] = [],
+        possibleLanguages: [String] = []
+    ) {
+        self.normalizedQuery = normalizedQuery
+        self.nameTokens = nameTokens
+        self.possibleNumbers = possibleNumbers
+        self.possibleSetCodes = possibleSetCodes
+        self.possibleRarities = possibleRarities
+        self.possibleLanguages = possibleLanguages
+    }
 }
 
 struct ScanPipelineResult: Equatable {
@@ -48,7 +79,7 @@ struct ScanPipelineArtifacts: Equatable {
 
 struct OCRRequestSettings {
     var recognitionLevel: VNRequestTextRecognitionLevel = .accurate
-    var recognitionLanguages: [String] = ["en-US", "de-DE"]
+    var recognitionLanguages: [String] = ["de-DE", "en-US"]
     var usesLanguageCorrection: Bool = false
     var minimumTextHeight: Float?
     var customConfigure: ((VNRecognizeTextRequest) -> Void)?
@@ -110,7 +141,8 @@ struct VisionScanPipelineService: ScanPipelineServing {
 
         var fields: [RecognizedCardField] = []
         fields += recognizeText(in: cardImage, region: .nameBand, settings: configuredSettings(for: .nameBand, base: settings))
-        fields += recognizeText(in: cardImage, region: .numberBand, settings: configuredSettings(for: .numberBand, base: settings))
+        fields += recognizeText(in: cardImage, region: .numberBandLeft, settings: configuredSettings(for: .numberBandLeft, base: settings))
+        fields += recognizeText(in: cardImage, region: .numberBandRight, settings: configuredSettings(for: .numberBandRight, base: settings))
         fields += recognizeText(in: cardImage, region: .fullCardFallback, settings: configuredSettings(for: .fullCardFallback, base: settings))
 
         return ScanPipelineArtifacts(
@@ -172,16 +204,23 @@ struct VisionScanPipelineService: ScanPipelineServing {
     private func configuredSettings(for region: ScanOCRRegion, base: OCRRequestSettings) -> OCRRequestSettings {
         var settings = base
         settings.recognitionLevel = .accurate
-        settings.recognitionLanguages = ["en-US", "de-DE"]
+        settings.recognitionLanguages = ["de-DE", "en-US"]
         settings.usesLanguageCorrection = false
 
         switch region {
         case .nameBand:
-            settings.minimumTextHeight = 0.035
-        case .numberBand:
-            settings.minimumTextHeight = 0.015
-        case .fullCardFallback:
+            settings.usesLanguageCorrection = true
+            settings.minimumTextHeight = 0.026
+            settings.customConfigure = { request in
+                request.customWords = nameCustomWords
+                request.automaticallyDetectsLanguage = true
+            }
+        case .numberBandLeft:
             settings.minimumTextHeight = 0.02
+        case .numberBandRight:
+            settings.minimumTextHeight = 0.02
+        case .fullCardFallback:
+            settings.minimumTextHeight = 0.028
         }
 
         return settings
@@ -189,10 +228,12 @@ struct VisionScanPipelineService: ScanPipelineServing {
 
     private func confidenceThreshold(for region: ScanOCRRegion) -> Float {
         switch region {
-        case .nameBand, .numberBand:
-            return 0.22
-        case .fullCardFallback:
+        case .nameBand:
             return 0.3
+        case .numberBandLeft, .numberBandRight:
+            return 0.34
+        case .fullCardFallback:
+            return 0.44
         }
     }
 
@@ -209,9 +250,11 @@ struct VisionScanPipelineService: ScanPipelineServing {
     private func normalizedRegionRect(for region: ScanOCRRegion) -> CGRect {
         switch region {
         case .nameBand:
-            return CGRect(x: 0.04, y: 0.01, width: 0.92, height: 0.25)
-        case .numberBand:
-            return CGRect(x: 0.5, y: 0.76, width: 0.42, height: 0.18)
+            return CGRect(x: 0.04, y: 0.01, width: 0.92, height: 0.3)
+        case .numberBandLeft:
+            return CGRect(x: 0.04, y: 0.74, width: 0.52, height: 0.22)
+        case .numberBandRight:
+            return CGRect(x: 0.5, y: 0.74, width: 0.46, height: 0.22)
         case .fullCardFallback:
             return CGRect(x: 0, y: 0, width: 1, height: 1)
         }
@@ -250,7 +293,7 @@ struct VisionScanPipelineService: ScanPipelineServing {
     }
 
     private func fieldPriority(_ lhs: RecognizedCardField, _ rhs: RecognizedCardField) -> Bool {
-        let regionRank: [ScanOCRRegion: Int] = [.nameBand: 3, .numberBand: 2, .fullCardFallback: 1]
+        let regionRank: [ScanOCRRegion: Int] = [.nameBand: 5, .numberBandLeft: 4, .numberBandRight: 3, .fullCardFallback: 1]
         let lhsRank = regionRank[lhs.region, default: 0]
         let rhsRank = regionRank[rhs.region, default: 0]
         if lhsRank != rhsRank {
@@ -262,6 +305,12 @@ struct VisionScanPipelineService: ScanPipelineServing {
         return lhs.text.count > rhs.text.count
     }
 }
+
+private let nameCustomWords = [
+    "Pokemon", "Pokémon", "EX", "GX", "V", "VMAX", "VSTAR",
+    "Radiant", "Trainer", "Supporter", "Stadium", "Energy",
+    "Shiny", "Holo", "Promo",
+]
 
 private extension ScanImageSource {
     var logName: String {

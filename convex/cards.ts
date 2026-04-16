@@ -13,6 +13,9 @@ const hintsValidator = v.optional(
     normalizedQuery: v.optional(v.string()),
     nameTokens: v.optional(v.array(v.string())),
     possibleNumbers: v.optional(v.array(v.string())),
+    possibleSetCodes: v.optional(v.array(v.string())),
+    possibleRarities: v.optional(v.array(v.string())),
+    possibleLanguages: v.optional(v.array(v.string())),
   }),
 );
 
@@ -33,6 +36,9 @@ export type LookupArgs = {
     normalizedQuery?: string;
     nameTokens?: string[];
     possibleNumbers?: string[];
+    possibleSetCodes?: string[];
+    possibleRarities?: string[];
+    possibleLanguages?: string[];
   };
 };
 
