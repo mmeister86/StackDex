@@ -170,8 +170,32 @@ struct OCRRequestSettings {
     var useAggressivePreprocessing: Bool = true
     var maxCandidatesPerObservation: Int = 3
     var customWords: [String] = []
-    var customConfigure: ((VNRecognizeTextRequest) -> Void)?
+    nonisolated(unsafe) var customConfigure: ((VNRecognizeTextRequest) -> Void)?
     var postProcessMode: ScanOCRPostProcessMode = .visionOnly
+
+    nonisolated init(
+        recognitionLevel: VNRequestTextRecognitionLevel = .accurate,
+        recognitionLanguages: [String] = ["de-DE", "en-US"],
+        usesLanguageCorrection: Bool = true,
+        automaticallyDetectsLanguage: Bool = false,
+        minimumTextHeight: Float? = nil,
+        useAggressivePreprocessing: Bool = true,
+        maxCandidatesPerObservation: Int = 3,
+        customWords: [String] = [],
+        customConfigure: ((VNRecognizeTextRequest) -> Void)? = nil,
+        postProcessMode: ScanOCRPostProcessMode = .visionOnly
+    ) {
+        self.recognitionLevel = recognitionLevel
+        self.recognitionLanguages = recognitionLanguages
+        self.usesLanguageCorrection = usesLanguageCorrection
+        self.automaticallyDetectsLanguage = automaticallyDetectsLanguage
+        self.minimumTextHeight = minimumTextHeight
+        self.useAggressivePreprocessing = useAggressivePreprocessing
+        self.maxCandidatesPerObservation = maxCandidatesPerObservation
+        self.customWords = customWords
+        self.customConfigure = customConfigure
+        self.postProcessMode = postProcessMode
+    }
 
     static let `default` = OCRRequestSettings()
 
@@ -226,22 +250,28 @@ struct VisionScanPipelineService: ScanPipelineServing {
     private let preprocessor: ScanImagePreprocessor
     private let detector: CardRegionDetector
     private let queryBuilder: ScanQueryBuilder
+    private let ocrTextRefiner: any OCRTextRefining
+    private let foundationTextModelReadiness: @Sendable () -> Bool
     private let ocrContext = CIContext()
     private let rawCandidateLimit = 10
 
     init(
         preprocessor: ScanImagePreprocessor = ScanImagePreprocessor(),
         detector: CardRegionDetector = CardRegionDetector(),
-        queryBuilder: ScanQueryBuilder = ScanQueryBuilder()
+        queryBuilder: ScanQueryBuilder = ScanQueryBuilder(),
+        ocrTextRefiner: any OCRTextRefining = SystemFoundationModelOCRTextRefiner(),
+        foundationTextModelReadiness: @escaping @Sendable () -> Bool = Self.defaultFoundationTextModelReadiness
     ) {
         self.preprocessor = preprocessor
         self.detector = detector
         self.queryBuilder = queryBuilder
+        self.ocrTextRefiner = ocrTextRefiner
+        self.foundationTextModelReadiness = foundationTextModelReadiness
     }
 
     func process(
         input: ScanImageInput,
-        settings: OCRRequestSettings = .default
+        settings: OCRRequestSettings = OCRRequestSettings()
     ) async throws -> ScanPipelineResult {
         let artifacts = try await inspect(input: input, settings: settings)
         let recognizedTexts = deduplicatedTexts(from: artifacts.recognizedFields)
@@ -259,7 +289,7 @@ struct VisionScanPipelineService: ScanPipelineServing {
 
     func inspect(
         input: ScanImageInput,
-        settings: OCRRequestSettings = .default
+        settings: OCRRequestSettings = OCRRequestSettings()
     ) async throws -> ScanPipelineArtifacts {
         let normalized = try preprocessor.normalize(input: input)
         let cardImage = try detector.detectAndRectify(from: normalized)
@@ -288,7 +318,12 @@ struct VisionScanPipelineService: ScanPipelineServing {
         fields += fallbackResult.fields
         rawObservations += fallbackResult.rawObservations
 
-        let refinedFields = await applyTwoStagePostProcessing(to: fields, mode: settings.postProcessMode)
+        let refinedFields = await applyTwoStagePostProcessing(
+            to: fields,
+            rawObservations: rawObservations,
+            usedFullImageFallback: cardImage.usedFallback,
+            mode: settings.postProcessMode
+        )
 
         return ScanPipelineArtifacts(
             recognizedFields: deduplicatedFields(refinedFields),
@@ -411,30 +446,53 @@ struct VisionScanPipelineService: ScanPipelineServing {
 
     private func applyTwoStagePostProcessing(
         to fields: [RecognizedCardField],
+        rawObservations: [ScanRawOCRObservation],
+        usedFullImageFallback: Bool,
         mode: ScanOCRPostProcessMode
     ) async -> [RecognizedCardField] {
         guard mode.needsTwoStep else {
             return fields
         }
 
-        #if canImport(FoundationModels)
-        if #available(iOS 26, *), isFoundationTextModelReady {
-            logger.debug("Applying optional second OCR post-processing stage.")
-        } else {
-            logger.debug("Foundation Model text refinement unavailable; using fallback post-processing.")
-        }
-        #else
-        logger.debug("FoundationModels module not available; using fallback post-processing.")
-        #endif
+        let fallbackFields = fallbackOCRPostProcessing(fields)
 
-        return fallbackOCRPostProcessing(fields)
+        guard isFoundationTextModelReady else {
+            logger.debug("Foundation Model text refinement unavailable; using fallback post-processing.")
+            return fallbackFields
+        }
+
+        let initialHints = queryBuilder.buildHints(from: fallbackFields)
+        let evidence = makeOCRRefinementEvidence(from: fallbackFields, rawObservations: rawObservations)
+        guard shouldRunFoundationRefinement(
+            evidence: evidence,
+            initialHints: initialHints,
+            usedFullImageFallback: usedFullImageFallback
+        ) else {
+            logger.debug("Skipping Foundation Model OCR refinement because OCR signals are already strong.")
+            return fallbackFields
+        }
+
+        do {
+            guard let selection = try await ocrTextRefiner.refine(evidence: evidence) else {
+                logger.debug("Foundation Model OCR refinement returned no selection; keeping fallback result.")
+                return fallbackFields
+            }
+            guard let validatedSelection = validated(selection: selection, against: evidence) else {
+                logger.debug("Foundation Model OCR refinement returned invalid candidate IDs; keeping fallback result.")
+                return fallbackFields
+            }
+            logger.debug("Applying Foundation Model OCR refinement to name/collector number candidates.")
+            return mergeRefinedCandidates(into: fallbackFields, selection: validatedSelection, evidence: evidence)
+        } catch {
+            logger.error("Foundation Model OCR refinement failed: \(error.localizedDescription, privacy: .public)")
+            return fallbackFields
+        }
     }
 
-    private var isFoundationTextModelReady: Bool {
+    nonisolated private static func defaultFoundationTextModelReadiness() -> Bool {
         #if targetEnvironment(simulator)
         return false
-        #endif
-
+        #else
         #if canImport(FoundationModels)
         if getuid() == 0 {
             return false
@@ -449,6 +507,11 @@ struct VisionScanPipelineService: ScanPipelineServing {
         }
         #endif
         return false
+        #endif
+    }
+
+    private var isFoundationTextModelReady: Bool {
+        foundationTextModelReadiness()
     }
 
     private func fallbackOCRPostProcessing(_ fields: [RecognizedCardField]) -> [RecognizedCardField] {
@@ -482,6 +545,248 @@ struct VisionScanPipelineService: ScanPipelineServing {
             .joined(separator: " ")
     }
 
+    private func makeOCRRefinementEvidence(
+        from fields: [RecognizedCardField],
+        rawObservations: [ScanRawOCRObservation]
+    ) -> OCRRefinementEvidence {
+        let nameCandidates = makeNameRefinementCandidates(from: fields)
+        let collectorCandidates = makeCollectorNumberCandidates(from: rawObservations, fields: fields)
+
+        return OCRRefinementEvidence(
+            currentBestNameCandidateID: nameCandidates.first?.id,
+            currentBestCollectorNumberCandidateID: collectorCandidates.first?.id,
+            nameCandidates: nameCandidates,
+            collectorNumberCandidates: collectorCandidates
+        )
+    }
+
+    private func shouldRunFoundationRefinement(
+        evidence: OCRRefinementEvidence,
+        initialHints: ScanLookupHints,
+        usedFullImageFallback: Bool
+    ) -> Bool {
+        guard evidence.hasUsefulCandidates else {
+            return false
+        }
+
+        let nameNeedsHelp = !evidence.nameCandidates.isEmpty && (
+            evidence.nameCandidates.count > 1 ||
+            initialHints.signalQuality.isWeakNameSignal ||
+            usedFullImageFallback
+        )
+        let collectorNeedsHelp = !evidence.collectorNumberCandidates.isEmpty && (
+            evidence.collectorNumberCandidates.count > 1 ||
+            !initialHints.signalQuality.hasCollectorNumberSignal ||
+            usedFullImageFallback
+        )
+
+        return nameNeedsHelp || collectorNeedsHelp
+    }
+
+    private func makeNameRefinementCandidates(from fields: [RecognizedCardField]) -> [OCRRefinementCandidate] {
+        var seen: Set<String> = []
+        var candidates: [OCRRefinementCandidate] = []
+
+        let rankedFields = fields
+            .sorted(by: fieldPriority)
+            .filter { $0.region == .titleStrip || $0.region == .evolutionLine }
+
+        for field in rankedFields {
+            let normalizedText = field.text
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard !normalizedText.isEmpty, seen.insert(normalizedText).inserted else {
+                continue
+            }
+
+            candidates.append(
+                OCRRefinementCandidate(
+                    id: "name-\(candidates.count)",
+                    text: field.text,
+                    region: field.region.rawValue,
+                    confidence: field.confidence
+                )
+            )
+
+            if candidates.count == 6 {
+                break
+            }
+        }
+
+        return candidates
+    }
+
+    private func makeCollectorNumberCandidates(
+        from rawObservations: [ScanRawOCRObservation],
+        fields: [RecognizedCardField]
+    ) -> [OCRRefinementCandidate] {
+        var seen: Set<String> = []
+        var candidates: [OCRRefinementCandidate] = []
+
+        let rankedObservations = rawObservations
+            .filter { $0.region == .collectorFooter || $0.region == .fullCardFallback }
+            .sorted { lhs, rhs in
+                let lhsRank = lhs.region == .collectorFooter ? 1 : 0
+                let rhsRank = rhs.region == .collectorFooter ? 1 : 0
+                if lhsRank != rhsRank {
+                    return lhsRank > rhsRank
+                }
+                let lhsConfidence = lhs.candidates.first?.confidence ?? 0
+                let rhsConfidence = rhs.candidates.first?.confidence ?? 0
+                return lhsConfidence > rhsConfidence
+            }
+
+        for observation in rankedObservations {
+            for rawCandidate in observation.candidates {
+                for token in tokenizeCollectorNumberCandidates(from: rawCandidate.text) {
+                    guard seen.insert(token).inserted else {
+                        continue
+                    }
+                    candidates.append(
+                        OCRRefinementCandidate(
+                            id: "collector-\(candidates.count)",
+                            text: token,
+                            region: observation.region.rawValue,
+                            confidence: rawCandidate.confidence
+                        )
+                    )
+                    if candidates.count == 6 {
+                        return candidates
+                    }
+                }
+            }
+        }
+
+        if candidates.isEmpty {
+            let fallbackFields = fields
+                .sorted(by: fieldPriority)
+                .filter { $0.region == .collectorFooter || $0.region == .fullCardFallback }
+
+            for field in fallbackFields {
+                for token in tokenizeCollectorNumberCandidates(from: field.text) {
+                    guard seen.insert(token).inserted else {
+                        continue
+                    }
+                    candidates.append(
+                        OCRRefinementCandidate(
+                            id: "collector-\(candidates.count)",
+                            text: token,
+                            region: field.region.rawValue,
+                            confidence: field.confidence
+                        )
+                    )
+                    if candidates.count == 6 {
+                        return candidates
+                    }
+                }
+            }
+        }
+
+        return candidates
+    }
+
+    private func tokenizeCollectorNumberCandidates(from text: String) -> [String] {
+        let pattern = #"\b\d{1,3}/\d{1,3}\b|\b\d{1,3}\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return []
+        }
+
+        let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.matches(in: text, range: nsRange).compactMap { match in
+            guard let range = Range(match.range, in: text) else {
+                return nil
+            }
+            return String(text[range])
+        }
+    }
+
+    private func validated(
+        selection: OCRRefinementSelection,
+        against evidence: OCRRefinementEvidence
+    ) -> OCRRefinementSelection? {
+        let validNameIDs = Set(evidence.nameCandidates.map(\.id))
+        let validCollectorIDs = Set(evidence.collectorNumberCandidates.map(\.id))
+
+        if let nameID = selection.selectedNameCandidateID,
+           !validNameIDs.contains(nameID) {
+            return nil
+        }
+
+        if let collectorID = selection.selectedCollectorNumberCandidateID,
+           !validCollectorIDs.contains(collectorID) {
+            return nil
+        }
+
+        guard selection.selectedNameCandidateID != nil || selection.selectedCollectorNumberCandidateID != nil else {
+            return nil
+        }
+
+        return selection
+    }
+
+    private func mergeRefinedCandidates(
+        into fields: [RecognizedCardField],
+        selection: OCRRefinementSelection,
+        evidence: OCRRefinementEvidence
+    ) -> [RecognizedCardField] {
+        var mergedFields = fields
+
+        if let nameID = selection.selectedNameCandidateID,
+           let candidate = evidence.nameCandidates.first(where: { $0.id == nameID }) {
+            mergedFields = upsertingRefinedField(
+                candidate.text,
+                preferredRegion: .titleStrip,
+                sourceConfidence: candidate.confidence,
+                into: mergedFields
+            )
+        }
+
+        if let collectorID = selection.selectedCollectorNumberCandidateID,
+           let candidate = evidence.collectorNumberCandidates.first(where: { $0.id == collectorID }) {
+            mergedFields = upsertingRefinedField(
+                candidate.text,
+                preferredRegion: .collectorFooter,
+                sourceConfidence: candidate.confidence,
+                into: mergedFields
+            )
+        }
+
+        return deduplicatedFields(mergedFields)
+    }
+
+    private func upsertingRefinedField(
+        _ text: String,
+        preferredRegion: ScanOCRRegion,
+        sourceConfidence: Float,
+        into fields: [RecognizedCardField]
+    ) -> [RecognizedCardField] {
+        let normalizedText = correctedOCRText(text)
+        guard !normalizedText.isEmpty else {
+            return fields
+        }
+
+        if fields.contains(where: { $0.region == preferredRegion && $0.text.caseInsensitiveCompare(normalizedText) == .orderedSame }) {
+            return fields
+        }
+
+        let boundingBox = fields
+            .first(where: { $0.region == preferredRegion })?
+            .boundingBox
+            ?? fields.first?.boundingBox
+            ?? .zero
+
+        var updatedFields = fields
+        updatedFields.append(
+            RecognizedCardField(
+                text: normalizedText,
+                confidence: min(1.0, max(sourceConfidence, 0.98)),
+                region: preferredRegion,
+                boundingBox: boundingBox
+            )
+        )
+        return updatedFields
+    }
+
     private func preprocessForOCR(cgImage: CGImage, settings: OCRRequestSettings) -> CGImage {
         let inputImage = CIImage(cgImage: cgImage)
         let colorControls: [String: NSNumber] = settings.useAggressivePreprocessing
@@ -505,7 +810,7 @@ struct VisionScanPipelineService: ScanPipelineServing {
                 kCIInputIntensityKey as String: NSNumber(value: 0.3),
             ]
 
-        var enhancedImage = inputImage
+        let enhancedImage = inputImage
             .applyingFilter("CIColorControls", parameters: [
                 kCIInputContrastKey as String: colorControls[kCIInputContrastKey as String]!,
                 kCIInputBrightnessKey as String: colorControls[kCIInputBrightnessKey as String] ?? NSNumber(value: 0),

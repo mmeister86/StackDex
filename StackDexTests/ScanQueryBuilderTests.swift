@@ -133,4 +133,24 @@ import Testing
         #expect(hints.nameTokens.isEmpty)
         #expect(hints.normalizedQuery.isEmpty)
     }
+
+    @Test func canonicalizesKnownPokemonNameFromBundledListPreservingSuffixAndNumber() {
+        let hints = builder.buildHints(from: [
+            .init(text: "flabebe ex", confidence: 0.98, region: .titleStrip, boundingBox: CGRect(x: 0.1, y: 0.05, width: 0.7, height: 0.1)),
+            .init(text: "036/191", confidence: 0.88, region: .collectorFooter, boundingBox: CGRect(x: 0.68, y: 0.88, width: 0.2, height: 0.06)),
+        ])
+
+        #expect(hints.normalizedQuery == "Flabébé ex 036/191")
+        #expect(hints.nameTokens == ["Flabébé", "ex"])
+    }
+
+    @Test func leavesUnlistedNamesUntouchedWhenNoCanonicalMatchExists() {
+        let hints = builder.buildHints(from: [
+            .init(text: "Charizard ex", confidence: 0.98, region: .titleStrip, boundingBox: CGRect(x: 0.1, y: 0.05, width: 0.7, height: 0.1)),
+            .init(text: "006/165", confidence: 0.88, region: .collectorFooter, boundingBox: CGRect(x: 0.68, y: 0.88, width: 0.2, height: 0.06)),
+        ])
+
+        #expect(hints.normalizedQuery == "Charizard ex 006/165")
+        #expect(hints.nameTokens == ["Charizard", "ex"])
+    }
 }

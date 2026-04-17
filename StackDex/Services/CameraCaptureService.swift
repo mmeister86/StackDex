@@ -1,6 +1,7 @@
 import AVFoundation
 import Combine
 import Foundation
+import Vision
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -53,17 +54,21 @@ final class CameraCaptureService: NSObject, ObservableObject {
     @Published private(set) var interruptionState: SessionInterruptionState = .none
     @Published private(set) var zoomState: ZoomState = .unavailable
     @Published private(set) var isSessionRunning = false
+    @Published private(set) var liveOCRBoundingBoxes: [CGRect] = []
+    @Published private(set) var liveOCRLastUpdatedAt: Date?
     let session = AVCaptureSession()
 
     private let sessionQueue = DispatchQueue(label: "stackdex.camera.session")
     private let photoOutput = AVCapturePhotoOutput()
+    private let videoOutput = AVCaptureVideoDataOutput()
+    private let ocrQueue = DispatchQueue(label: "stackdex.camera.ocr", qos: .userInitiated)
     private var isConfigured = false
     private var captureHandler: ((Result<UIImage, Error>) -> Void)?
     private var activeDevice: AVCaptureDevice?
     private var previewLayer: AVCaptureVideoPreviewLayer?
     private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
     private var rotationObservation: NSKeyValueObservation?
-    private var captureRotationAngle: CGFloat = 0
+    nonisolated(unsafe) private var captureRotationAngle: CGFloat = 0
     private var interruptionObservers: [NSObjectProtocol] = []
     private var subjectAreaDidChangeObserver: NSObjectProtocol?
     private var autoFocusRecenterWorkItem: DispatchWorkItem?
@@ -71,6 +76,12 @@ final class CameraCaptureService: NSObject, ObservableObject {
     private var zoomRange: ClosedRange<CGFloat> = 1 ... 1
     private var zoomSteps: [CGFloat] = [1]
     private var pinchBaseZoomFactor: CGFloat?
+    nonisolated(unsafe) private var isProcessingOCRFrame = false
+    nonisolated(unsafe) private var lastOCRFrameProcessDate: CFAbsoluteTime = 0
+    private var liveOCRExpiryTask: Task<Void, Never>?
+    private var uiTestLiveOCRTask: Task<Void, Never>?
+    private let liveOCRStaleInterval: TimeInterval = 0.9
+    private var pendingMetadataOCRRects: [CGRect] = []
 
     override init() {
         authorizationStatus = AVCaptureDevice.authorizationStatus(for: .video)
@@ -79,6 +90,11 @@ final class CameraCaptureService: NSObject, ObservableObject {
         if ProcessInfo.processInfo.arguments.contains("-uitest-scanner-interrupted") {
             interruptionState = .interrupted(message: "Kamera voruebergehend nicht verfuegbar. Nach der Unterbrechung erneut versuchen.")
         }
+
+        Task { @MainActor [weak self] in
+            self?.startUITestLiveOCRSimulationIfNeeded()
+        }
+
     }
 
     deinit {
@@ -88,6 +104,8 @@ final class CameraCaptureService: NSObject, ObservableObject {
         }
         autoFocusRecenterWorkItem?.cancel()
         focusResetTask?.cancel()
+        liveOCRExpiryTask?.cancel()
+        uiTestLiveOCRTask?.cancel()
     }
 
     func refreshAuthorizationStatus() {
@@ -115,6 +133,7 @@ final class CameraCaptureService: NSObject, ObservableObject {
             self.session.startRunning()
             Task { @MainActor in
                 self.isSessionRunning = true
+                self.startUITestLiveOCRSimulationIfNeeded()
             }
         }
     }
@@ -125,6 +144,8 @@ final class CameraCaptureService: NSObject, ObservableObject {
             self.session.stopRunning()
             Task { @MainActor in
                 self.isSessionRunning = false
+                self.clearLiveOCRBoxes()
+                self.stopUITestLiveOCRSimulation()
             }
         }
     }
@@ -134,6 +155,9 @@ final class CameraCaptureService: NSObject, ObservableObject {
             guard let self else { return }
             self.previewLayer = previewLayer
             self.configureRotationCoordinatorIfPossible()
+            Task { @MainActor [weak self] in
+                self?.flushPendingLiveOCRBoxesIfPossible()
+            }
         }
     }
 
@@ -142,6 +166,9 @@ final class CameraCaptureService: NSObject, ObservableObject {
             self?.rotationObservation = nil
             self?.rotationCoordinator = nil
             self?.previewLayer = nil
+            Task { @MainActor [weak self] in
+                self?.clearLiveOCRBoxes()
+            }
         }
     }
 
@@ -339,6 +366,19 @@ final class CameraCaptureService: NSObject, ObservableObject {
 
             self.session.addOutput(self.photoOutput)
             self.photoOutput.maxPhotoQualityPrioritization = .quality
+
+            if self.session.canAddOutput(self.videoOutput) {
+                self.videoOutput.alwaysDiscardsLateVideoFrames = true
+                self.videoOutput.videoSettings = [
+                    kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                ]
+                self.videoOutput.setSampleBufferDelegate(self, queue: self.ocrQueue)
+                self.session.addOutput(self.videoOutput)
+                if let connection = self.videoOutput.connection(with: .video), connection.isVideoMirroringSupported {
+                    connection.isVideoMirrored = false
+                }
+            }
+
             self.configureDefaultScannerFocusAndExposure(for: camera)
             self.configureZoom(for: camera)
             self.registerSubjectAreaChangeObserver(for: camera)
@@ -454,6 +494,7 @@ final class CameraCaptureService: NSObject, ObservableObject {
             ) { [weak self] _ in
                 self?.interruptionState = .none
                 self?.isSessionRunning = self?.session.isRunning ?? false
+                self?.clearLiveOCRBoxes()
             }
         )
     }
@@ -466,6 +507,121 @@ final class CameraCaptureService: NSObject, ObservableObject {
         let rawReason = notification.userInfo?[AVCaptureSessionInterruptionReasonKey] as? NSNumber
         let reason = rawReason.flatMap { AVCaptureSession.InterruptionReason(rawValue: $0.intValue) }
         interruptionState = .interrupted(message: interruptionMessage(for: reason))
+        clearLiveOCRBoxes()
+    }
+
+    @MainActor
+    private func publishLiveOCRBoxes(_ boxes: [CGRect]) {
+        liveOCRExpiryTask?.cancel()
+        liveOCRBoundingBoxes = boxes
+        liveOCRLastUpdatedAt = Date()
+
+        guard !boxes.isEmpty else {
+            return
+        }
+
+        let publishedAt = liveOCRLastUpdatedAt
+        liveOCRExpiryTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(for: .seconds(liveOCRStaleInterval))
+            guard !Task.isCancelled else { return }
+            guard self.liveOCRLastUpdatedAt == publishedAt else { return }
+            self.clearLiveOCRBoxes()
+        }
+    }
+
+    @MainActor
+    private func clearLiveOCRBoxes() {
+        liveOCRExpiryTask?.cancel()
+        liveOCRExpiryTask = nil
+        liveOCRBoundingBoxes = []
+        liveOCRLastUpdatedAt = nil
+        pendingMetadataOCRRects = []
+    }
+
+    @MainActor
+    private func publishLiveOCRBoxes(fromMetadataRects metadataRects: [CGRect]) {
+        let clampToUnitRect: (CGRect) -> CGRect? = { rect in
+            let clampedMinX = min(max(rect.minX, 0), 1)
+            let clampedMinY = min(max(rect.minY, 0), 1)
+            let clampedMaxX = min(max(rect.maxX, 0), 1)
+            let clampedMaxY = min(max(rect.maxY, 0), 1)
+
+            let clamped = CGRect(
+                x: clampedMinX,
+                y: clampedMinY,
+                width: max(0, clampedMaxX - clampedMinX),
+                height: max(0, clampedMaxY - clampedMinY)
+            )
+
+            return clamped.isEmpty ? nil : clamped
+        }
+
+        guard let previewLayer else {
+            pendingMetadataOCRRects = metadataRects
+            if ProcessInfo.processInfo.arguments.contains("-uitest-live-ocr-boxes") {
+                publishLiveOCRBoxes(metadataRects.compactMap(clampToUnitRect))
+            }
+            return
+        }
+
+        let bounds = previewLayer.bounds
+        guard bounds.width > 0, bounds.height > 0 else {
+            pendingMetadataOCRRects = metadataRects
+            if ProcessInfo.processInfo.arguments.contains("-uitest-live-ocr-boxes") {
+                publishLiveOCRBoxes(metadataRects.compactMap(clampToUnitRect))
+            }
+            return
+        }
+
+        let normalizedBoxes = metadataRects.compactMap { metadataRect -> CGRect? in
+            let layerRect = previewLayer.layerRectConverted(fromMetadataOutputRect: metadataRect)
+            let normalized = CGRect(
+                x: layerRect.minX / bounds.width,
+                y: layerRect.minY / bounds.height,
+                width: layerRect.width / bounds.width,
+                height: layerRect.height / bounds.height
+            )
+
+            return clampToUnitRect(normalized)
+        }
+
+        publishLiveOCRBoxes(normalizedBoxes)
+        pendingMetadataOCRRects = []
+    }
+
+    @MainActor
+    private func flushPendingLiveOCRBoxesIfPossible() {
+        guard !pendingMetadataOCRRects.isEmpty else { return }
+        let pendingRects = pendingMetadataOCRRects
+        publishLiveOCRBoxes(fromMetadataRects: pendingRects)
+    }
+
+    @MainActor
+    private func startUITestLiveOCRSimulationIfNeeded() {
+        guard ProcessInfo.processInfo.arguments.contains("-uitest-live-ocr-boxes") else {
+            return
+        }
+
+        guard uiTestLiveOCRTask == nil else {
+            return
+        }
+
+        let simulatedMetadataRects = [CGRect(x: 0.28, y: 0.24, width: 0.42, height: 0.12)]
+
+        uiTestLiveOCRTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                self.publishLiveOCRBoxes(fromMetadataRects: simulatedMetadataRects)
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+    }
+
+    @MainActor
+    private func stopUITestLiveOCRSimulation() {
+        uiTestLiveOCRTask?.cancel()
+        uiTestLiveOCRTask = nil
     }
 
     private func interruptionMessage(for reason: AVCaptureSession.InterruptionReason?) -> String {
@@ -569,6 +725,94 @@ final class CameraCaptureService: NSObject, ObservableObject {
                 steps: steps,
                 isAvailable: steps.count > 1 || (max - min) > 0.05
             )
+        }
+    }
+}
+
+extension CameraCaptureService: AVCaptureVideoDataOutputSampleBufferDelegate {
+    nonisolated func captureOutput(
+        _ output: AVCaptureOutput,
+        didOutput sampleBuffer: CMSampleBuffer,
+        from connection: AVCaptureConnection
+    ) {
+        let now = CFAbsoluteTimeGetCurrent()
+        guard now - lastOCRFrameProcessDate >= 0.18 else {
+            return
+        }
+        guard !isProcessingOCRFrame else {
+            return
+        }
+
+        isProcessingOCRFrame = true
+        lastOCRFrameProcessDate = now
+
+        defer {
+            isProcessingOCRFrame = false
+        }
+
+        let request = VNRecognizeTextRequest()
+        request.revision = VNRecognizeTextRequestRevision3
+        request.recognitionLevel = .fast
+        request.usesLanguageCorrection = false
+        request.automaticallyDetectsLanguage = true
+        request.minimumTextHeight = 0.03
+
+        let orientation: CGImagePropertyOrientation
+        if #available(iOS 17.0, *) {
+            orientation = cgImageOrientationForVideoRotationAngle(connection.videoRotationAngle)
+        } else {
+            orientation = cgImageOrientationForVideoRotationAngle(captureRotationAngle)
+        }
+        let handler = VNImageRequestHandler(cmSampleBuffer: sampleBuffer, orientation: orientation, options: [:])
+
+        do {
+            try handler.perform([request])
+        } catch {
+            Task { @MainActor [weak self] in
+                self?.clearLiveOCRBoxes()
+            }
+            return
+        }
+
+        let observations = (request.results ?? [])
+        let boxes = observations.compactMap { observation -> CGRect? in
+            guard let candidate = observation.topCandidates(1).first else {
+                return nil
+            }
+            guard candidate.confidence >= 0.45 else {
+                return nil
+            }
+
+            let visionRect = observation.boundingBox
+            let metadataRect = CGRect(
+                x: visionRect.minX,
+                y: 1 - visionRect.maxY,
+                width: visionRect.width,
+                height: visionRect.height
+            )
+
+            return metadataRect
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            publishLiveOCRBoxes(fromMetadataRects: boxes)
+        }
+    }
+
+    nonisolated private func cgImageOrientationForVideoRotationAngle(_ rotationAngle: CGFloat) -> CGImagePropertyOrientation {
+        let normalizedAngle = rotationAngle.truncatingRemainder(dividingBy: 360)
+        let positiveAngle = normalizedAngle >= 0 ? normalizedAngle : (normalizedAngle + 360)
+
+        switch positiveAngle {
+        case 45 ..< 135:
+            return .right
+        case 135 ..< 225:
+            return .down
+        case 225 ..< 315:
+            return .left
+        default:
+            return .up
         }
     }
 }

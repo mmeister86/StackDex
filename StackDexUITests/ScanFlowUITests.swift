@@ -73,6 +73,28 @@ final class ScanFlowUITests: XCTestCase {
     }
 
     @MainActor
+    func testScanScreenShowsLiveOCROverlayBeforeCapture() throws {
+        launchApp(extraArguments: ["-uitest-live-ocr-boxes"])
+
+        let scanTab = app.tabBars.buttons["Scannen"]
+        XCTAssertTrue(scanTab.waitForExistence(timeout: 2))
+        scanTab.tap()
+
+        let captureButton = app.buttons["scan.shell.capture"]
+        XCTAssertTrue(captureButton.waitForExistence(timeout: 4))
+        let liveOverlay = app.otherElements["scan.shell.liveOcrBoxes"]
+        let liveOverlayMarker = app.otherElements["scan.shell.liveOcrBoxes.marker"]
+        let liveBox = app.otherElements["scan.shell.ocrBox.0"]
+        let hasLiveOverlay =
+            liveOverlay.waitForExistence(timeout: 2)
+            || liveOverlayMarker.waitForExistence(timeout: 2)
+            || liveBox.waitForExistence(timeout: 2)
+
+        XCTAssertTrue(hasLiveOverlay)
+        XCTAssertFalse(app.otherElements["scan.sheet.root"].exists)
+    }
+
+    @MainActor
     func testOCRDebugTabExistsAndShowsEmptyStateInitially() throws {
         launchApp()
 

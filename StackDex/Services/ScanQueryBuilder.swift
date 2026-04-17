@@ -81,7 +81,9 @@ struct ScanQueryBuilder {
         let possibleRarities = rarityCandidates(from: cleanedFields)
         let possibleLanguages = languageCandidates(from: cleanedFields)
 
-        let preferredName = preferredNameSignal?.strength == .strong ? preferredNameSignal?.text : nil
+        let preferredName = preferredNameSignal?.strength == .strong
+            ? canonicalPreferredName(from: preferredNameSignal?.text)
+            : nil
         let normalizedQuery = structuredQuery(
             preferredName: preferredName,
             possibleNumbers: possibleNumbers,
@@ -129,6 +131,17 @@ struct ScanQueryBuilder {
         }
 
         return titleStripCandidates.first(where: { $0.strength == .weak })
+    }
+
+    private func canonicalPreferredName(from preferredName: String?) -> String? {
+        guard let preferredName = preferredName?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .nilIfEmpty else {
+            return nil
+        }
+
+        return PokemonNameCanonicalizer.canonicalize(preferredName, suffixTokens: nameSuffixTokens)
+            ?? preferredName
     }
 
     private func structuredQuery(

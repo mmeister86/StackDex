@@ -151,6 +151,17 @@ struct ScanTabView: View {
                 }
             }
 
+            if !camera.liveOCRBoundingBoxes.isEmpty {
+                ScanOCRBoundingBoxesOverlay(
+                    boxes: camera.liveOCRBoundingBoxes,
+                    overlayAccessibilityIdentifier: "scan.shell.liveOcrBoxes"
+                )
+
+                Color.clear
+                    .frame(width: 1, height: 1)
+                    .accessibilityIdentifier("scan.shell.liveOcrBoxes.marker")
+            }
+
             ScannerFocusOverlayView(
                 focusState: camera.focusIndicatorState,
                 isVisible: true
@@ -266,6 +277,7 @@ struct ScanTabView: View {
         GeometryReader { proxy in
             let width = min(proxy.size.width * 0.7, 270)
             let height = width * 1.4
+            let overlayBoxes = ocrBoundingBoxes
 
             VStack(spacing: 14) {
                 ZStack {
@@ -274,6 +286,10 @@ struct ScanTabView: View {
 
                     RoundedRectangle(cornerRadius: 18, style: .continuous)
                         .strokeBorder(.white.opacity(0.92), style: StrokeStyle(lineWidth: 3, dash: [16, 10]))
+
+                    if !overlayBoxes.isEmpty {
+                        ScanOCRBoundingBoxesOverlay(boxes: overlayBoxes)
+                    }
                 }
                 .frame(width: width, height: height)
                 .accessibilityElement(children: .ignore)
@@ -291,6 +307,17 @@ struct ScanTabView: View {
             .allowsHitTesting(false)
             .accessibilityElement(children: .contain)
         }
+    }
+
+    private var ocrBoundingBoxes: [CGRect] {
+        guard let pipelineResult = lastPipelineResult else {
+            return []
+        }
+
+        return pipelineResult.rawObservations
+            .map(\.boundingBox)
+            .map { $0.clampedToUnitRect() }
+            .filter { !$0.isEmpty }
     }
 
     private var cameraPreview: some View {
@@ -1094,6 +1121,59 @@ private struct CandidateThumbnailView: View {
                 Image(systemName: "photo")
                     .foregroundStyle(.secondary)
             }
+    }
+}
+
+private struct ScanOCRBoundingBoxesOverlay: View {
+    let boxes: [CGRect]
+    var overlayAccessibilityIdentifier: String = "scan.shell.ocrBoxes"
+
+    var body: some View {
+        GeometryReader { proxy in
+            ForEach(Array(boxes.enumerated()), id: \.offset) { index, box in
+                let mappedBox = box.denormalized(in: proxy.size)
+
+                if mappedBox.width > 1, mappedBox.height > 1 {
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .stroke(Color.green.opacity(0.95), lineWidth: 2)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                .fill(Color.green.opacity(0.14))
+                        )
+                        .frame(width: mappedBox.width, height: mappedBox.height)
+                        .position(x: mappedBox.midX, y: mappedBox.midY)
+                        .accessibilityIdentifier("scan.shell.ocrBox.\(index)")
+                }
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(overlayAccessibilityIdentifier)
+    }
+}
+
+private extension CGRect {
+    func clampedToUnitRect() -> CGRect {
+        let clampedMinX = min(max(minX, 0), 1)
+        let clampedMinY = min(max(minY, 0), 1)
+        let clampedMaxX = min(max(maxX, 0), 1)
+        let clampedMaxY = min(max(maxY, 0), 1)
+
+        return CGRect(
+            x: clampedMinX,
+            y: clampedMinY,
+            width: max(0, clampedMaxX - clampedMinX),
+            height: max(0, clampedMaxY - clampedMinY)
+        )
+    }
+
+    func denormalized(in size: CGSize) -> CGRect {
+        CGRect(
+            x: minX * size.width,
+            y: minY * size.height,
+            width: width * size.width,
+            height: height * size.height
+        )
     }
 }
 

@@ -9,6 +9,64 @@ struct VisionScanPipelineServiceTests {
     private let service = VisionScanPipelineService()
     private let preprocessor = ScanImagePreprocessor()
 
+    @Test func foundationRefinerDoesNotRunInVisionOnlyMode() async throws {
+        let refiner = TestOCRTextRefiner { _ in
+            OCRRefinementSelection(selectedNameCandidateID: "name-0", selectedCollectorNumberCandidateID: "collector-0")
+        }
+        let service = VisionScanPipelineService(
+            ocrTextRefiner: refiner,
+            foundationTextModelReadiness: { true }
+        )
+        let image = TestCardImageFactory.makeCardImage(name: "Pikachu ex", collectorNumber: "199/091")
+
+        _ = try await service.process(input: .captured(image), settings: .default)
+
+        #expect(await refiner.callCount == 0)
+    }
+
+    @Test func foundationRefinerCanInfluenceStructuredQueryWhenEnabled() async throws {
+        let refiner = TestOCRTextRefiner { evidence in
+            let nameID = evidence.nameCandidates.first(where: { $0.text.lowercased().contains("pikachu") })?.id
+            let collectorID = evidence.collectorNumberCandidates.first(where: { $0.text == "199/091" })?.id
+            return OCRRefinementSelection(
+                selectedNameCandidateID: nameID,
+                selectedCollectorNumberCandidateID: collectorID
+            )
+        }
+        let service = VisionScanPipelineService(
+            ocrTextRefiner: refiner,
+            foundationTextModelReadiness: { true }
+        )
+        let image = TestCardImageFactory.makeCardImage(name: "Pikachu ex", collectorNumber: "199/091")
+        var settings = OCRRequestSettings.default
+        settings.postProcessMode = .visionWithPostProcessing
+
+        let result = try await service.process(input: .captured(image), settings: settings)
+
+        #expect(await refiner.callCount == 1)
+        #expect(result.hints.normalizedQuery.lowercased().contains("pikachu"))
+        #expect(result.hints.possibleNumbers.contains("199/091"))
+    }
+
+    @Test func invalidFoundationRefinementFallsBackToDeterministicPostProcessing() async throws {
+        let refiner = TestOCRTextRefiner { _ in
+            OCRRefinementSelection(selectedNameCandidateID: "invalid-name", selectedCollectorNumberCandidateID: "invalid-collector")
+        }
+        let service = VisionScanPipelineService(
+            ocrTextRefiner: refiner,
+            foundationTextModelReadiness: { true }
+        )
+        let image = TestCardImageFactory.makeCardImage(name: "Pikachu ex", collectorNumber: "199/091")
+        var settings = OCRRequestSettings.default
+        settings.postProcessMode = .visionWithPostProcessing
+
+        let result = try await service.process(input: .captured(image), settings: settings)
+
+        #expect(await refiner.callCount == 1)
+        #expect(result.hints.possibleNumbers.contains("199/091"))
+        #expect(result.hints.normalizedQuery.lowercased().contains("pikachu"))
+    }
+
     @Test func topBandCardNameSurvivesOCR() async throws {
         let image = TestCardImageFactory.makeCardImage(name: "Pikachu ex", collectorNumber: "199/091")
 
@@ -55,6 +113,29 @@ struct VisionScanPipelineServiceTests {
         #expect(result.hints.possibleSetCodes.contains("SVI"))
         #expect(result.hints.possibleLanguages.contains("DE"))
         #expect(result.hints.possibleRarities.contains("Illustration Rare"))
+    }
+
+    @Test func canonicalPokemonNameFlowsIntoProgressiveLookupQuery() async throws {
+        let image = TestCardImageFactory.makeCardImage(name: "Flabebe ex", collectorNumber: "036/191")
+        let pipelineResult = try await service.process(input: .captured(image), settings: .default)
+        let recordingLookup = RecordingCardLookupService()
+        let progressiveLookup = ProgressiveScanLookupService(base: recordingLookup)
+
+        _ = await progressiveLookup.lookupScanCandidates(
+            for: CardLookupRequest(
+                recognizedTexts: pipelineResult.recognizedTexts,
+                query: pipelineResult.hints.normalizedQuery,
+                hints: pipelineResult.hints,
+                maxResults: 3
+            )
+        )
+
+        let receivedRequests = await recordingLookup.requests
+        let receivedQueries = receivedRequests.compactMap(\.query)
+
+        #expect(pipelineResult.hints.normalizedQuery == "Flabébé ex 036/191")
+        #expect(receivedQueries.first == "Flabébé ex 036/191")
+        #expect(receivedRequests.first?.hints?.nameTokens == ["Flabébé", "ex"])
     }
 
     @Test func importedOrientationNormalizesToUprightOCRContract() throws {
@@ -134,6 +215,33 @@ struct VisionScanPipelineServiceTests {
 
         #expect(fullText.contains("pikachu"))
         #expect(fullText.contains("199/091"))
+    }
+}
+
+private actor TestOCRTextRefiner: OCRTextRefining {
+    private var storedCallCount = 0
+    private let handler: (OCRRefinementEvidence) -> OCRRefinementSelection?
+
+    init(handler: @escaping (OCRRefinementEvidence) -> OCRRefinementSelection?) {
+        self.handler = handler
+    }
+
+    func refine(evidence: OCRRefinementEvidence) async throws -> OCRRefinementSelection? {
+        storedCallCount += 1
+        return handler(evidence)
+    }
+
+    var callCount: Int {
+        storedCallCount
+    }
+}
+
+private actor RecordingCardLookupService: CardLookupServing {
+    private(set) var requests: [CardLookupRequest] = []
+
+    func lookupCandidates(for request: CardLookupRequest) async -> [CardLookupCandidate] {
+        requests.append(request)
+        return []
     }
 }
 
