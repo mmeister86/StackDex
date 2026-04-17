@@ -72,4 +72,15 @@ final class ScanFlowUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Kein passender Kartenkandidat gefunden."].waitForExistence(timeout: 3))
     }
 
+    @MainActor
+    func testOCRDebugTabExistsAndShowsEmptyStateInitially() throws {
+        launchApp()
+
+        let debugTab = app.tabBars.buttons["OCR Debug"]
+        XCTAssertTrue(debugTab.waitForExistence(timeout: 3))
+        debugTab.tap()
+
+        XCTAssertTrue(app.staticTexts["Noch kein OCR-Lauf"].waitForExistence(timeout: 3))
+    }
+
 }

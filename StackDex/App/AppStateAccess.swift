@@ -71,6 +71,34 @@ enum AppStateAccess {
         try? context.save()
     }
 
+    static func scanOCRQualityPreset(in context: ModelContext) -> ScanOCRQualityPreset {
+        let state = primary(in: context)
+        guard let rawValue = state.scanOCRQualityPresetRawValue else {
+            return .maximum
+        }
+        return ScanOCRQualityPreset(rawValue: rawValue) ?? .maximum
+    }
+
+    static func setScanOCRQualityPreset(_ preset: ScanOCRQualityPreset, in context: ModelContext) {
+        let state = primary(in: context)
+        state.scanOCRQualityPresetRawValue = preset.rawValue
+        try? context.save()
+    }
+
+    static func scanOCRPostProcessMode(in context: ModelContext) -> ScanOCRPostProcessMode {
+        let state = primary(in: context)
+        guard let rawValue = state.scanOCRPostProcessModeRawValue else {
+            return .visionOnly
+        }
+        return ScanOCRPostProcessMode(rawValue: rawValue) ?? .visionOnly
+    }
+
+    static func setScanOCRPostProcessMode(_ mode: ScanOCRPostProcessMode, in context: ModelContext) {
+        let state = primary(in: context)
+        state.scanOCRPostProcessModeRawValue = mode.rawValue
+        try? context.save()
+    }
+
     static func resolveAfterDeletion(
         deletedCollectionID: UUID,
         in context: ModelContext,

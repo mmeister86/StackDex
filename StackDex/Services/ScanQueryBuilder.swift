@@ -1,19 +1,14 @@
 import CoreGraphics
 import Foundation
 
-enum ScanOCRRegion: String, Equatable {
-    case titleStrip
-    case evolutionLine
-    case attackBox
-    case collectorFooter
-    case fullCardFallback
+private enum NameSignalStrength {
+    case strong
+    case weak
 }
 
-struct RecognizedCardField: Equatable {
+private struct NameSignal {
     let text: String
-    let confidence: Float
-    let region: ScanOCRRegion
-    let boundingBox: CGRect
+    let strength: NameSignalStrength
 }
 
 struct ScanQueryBuilder {
@@ -30,6 +25,27 @@ struct ScanQueryBuilder {
     private let setCodeStopWords: Set<String> = [
         "UND", "ODER", "DIE", "DER", "DAS", "DEN", "DES", "DEM", "EIN", "EINE", "EINEM",
         "ZUR", "ZUM", "VON", "MIT", "AUS", "DU", "AUR", "THE", "AND", "FOR", "WITH", "YOUR", "YOU",
+        "ZUGES",
+        "VIELE",
+        "BORA",
+        "INC",
+        "SET",
+        "CARD",
+        "CARDSET",
+        "CARDSET?",
+        "POKEMON",
+        "EN",
+        "DE",
+        "NOT",
+        "ARE",
+        "THIS",
+        "THAT",
+        "WAS",
+        "WILL",
+        "FROM",
+        "WITH",
+        "YOUR",
+        "YOU",
     ]
     private let uiNoiseNameTokens: Set<String> = [
         "gespeicherte", "elemente", "gate", "games", "kamera", "camera", "foto", "photo",
@@ -58,12 +74,14 @@ struct ScanQueryBuilder {
             }
             .filter { !$0.text.isEmpty }
 
-        let preferredName = preferredName(from: cleanedFields)
+        let preferredNameSignal = preferredName(from: cleanedFields)
         let possibleNumbers = numberCandidates(from: cleanedFields)
-        let possibleSetCodes = setCodeCandidates(from: cleanedFields)
+        let setCodeResult = setCodeCandidates(from: cleanedFields)
+        let possibleSetCodes = setCodeResult.setCodes
         let possibleRarities = rarityCandidates(from: cleanedFields)
         let possibleLanguages = languageCandidates(from: cleanedFields)
 
+        let preferredName = preferredNameSignal?.strength == .strong ? preferredNameSignal?.text : nil
         let normalizedQuery = structuredQuery(
             preferredName: preferredName,
             possibleNumbers: possibleNumbers,
@@ -78,27 +96,39 @@ struct ScanQueryBuilder {
             nameTokens = normalizedQuery.isEmpty ? [] : tokenizeName(normalizedQuery)
         }
 
+        let signalQuality = ScanSignalQuality(
+            isWeakNameSignal: preferredNameSignal?.strength == .weak,
+            hasCollectorNumberSignal: possibleNumbers.contains(where: { $0.contains("/") }),
+            hasSuspiciousSetCodes: setCodeResult.hasSuspiciousSetCodes
+        )
+
         return ScanLookupHints(
             normalizedQuery: normalizedQuery,
             nameTokens: nameTokens,
             possibleNumbers: possibleNumbers,
             possibleSetCodes: possibleSetCodes,
             possibleRarities: possibleRarities,
-            possibleLanguages: possibleLanguages
+            possibleLanguages: possibleLanguages,
+            signalQuality: signalQuality
         )
     }
 
-    private func preferredName(from fields: [RecognizedCardField]) -> String? {
-        let bestInTitleStrip = fields
+    private func preferredName(from fields: [RecognizedCardField]) -> NameSignal? {
+        let titleStripCandidates = fields
             .filter { $0.region == .titleStrip }
             .sorted(by: fieldPriority)
-            .first(where: { looksLikeNameField($0.text) })
+            .compactMap { field -> NameSignal? in
+                guard let strength = evaluateNameSignal(for: field) else {
+                    return nil
+                }
+                return NameSignal(text: field.text, strength: strength)
+            }
 
-        if let bestInTitleStrip {
-            return bestInTitleStrip.text
+        if let strong = titleStripCandidates.first(where: { $0.strength == .strong }) {
+            return strong
         }
 
-        return nil
+        return titleStripCandidates.first(where: { $0.strength == .weak })
     }
 
     private func structuredQuery(
@@ -126,11 +156,10 @@ struct ScanQueryBuilder {
             return trimmedName
         }
 
-        if let number, number.contains("/"), let setCode {
-            return "\(number) \(setCode)"
-        }
-
         if let number, number.contains("/") {
+            if let setCode {
+                return "\(number) \(setCode)"
+            }
             return number
         }
 
@@ -162,62 +191,53 @@ struct ScanQueryBuilder {
         return numbers
     }
 
-    private func setCodeCandidates(from fields: [RecognizedCardField]) -> [String] {
+    private func setCodeCandidates(from fields: [RecognizedCardField]) -> (setCodes: [String], hasSuspiciousSetCodes: Bool) {
         var seen: Set<String> = []
         var setCodes: [String] = []
+        var hasSuspiciousSetCodes = false
 
         let footerFields = fields
             .sorted(by: fieldPriority)
             .filter { $0.region == .collectorFooter }
 
         for field in footerFields {
-            let tokens: [String]
-            tokens = tokensNearCollectorNumber(in: field.text)
-            if tokens.isEmpty {
-                continue
+            let extraction = parseSetCodeCandidates(
+                from: field.text,
+                allowLanguageInterveningTokens: false,
+                seen: &seen,
+                maxCount: 4
+            )
+            if extraction.hasSuspiciousSetCodes {
+                hasSuspiciousSetCodes = true
             }
-
-            for token in tokens {
-                let normalized = normalizeAlphaNumeric(token).uppercased()
-                guard normalized.count >= 2, normalized.count <= 5 else { continue }
-                guard !languageTokens.contains(normalized) else { continue }
-                guard !setCodeStopWords.contains(normalized) else { continue }
-                guard !isNumberLike(normalized) else { continue }
-                guard !noisyBodyKeywords.contains(normalized.lowercased()) else { continue }
-                guard !isRarityToken(normalized.lowercased()) else { continue }
-                guard looksLikeSetCode(normalized) else { continue }
-                guard seen.insert(normalized).inserted else { continue }
-                setCodes.append(normalized)
-                if setCodes.count == 4 {
-                    return setCodes
-                }
+            setCodes.append(contentsOf: extraction.setCodes)
+            if setCodes.count == 4 {
+                return (Array(setCodes.prefix(4)), hasSuspiciousSetCodes)
             }
         }
 
         if !setCodes.isEmpty {
-            return setCodes
+            return (Array(setCodes.prefix(4)), hasSuspiciousSetCodes)
         }
 
         for field in footerFields {
-            for token in tokenize(field.text) {
-                let normalized = normalizeAlphaNumeric(token).uppercased()
-                guard normalized.count >= 2, normalized.count <= 5 else { continue }
-                guard !languageTokens.contains(normalized) else { continue }
-                guard !setCodeStopWords.contains(normalized) else { continue }
-                guard !isNumberLike(normalized) else { continue }
-                guard !noisyBodyKeywords.contains(normalized.lowercased()) else { continue }
-                guard !isRarityToken(normalized.lowercased()) else { continue }
-                guard looksLikeSetCode(normalized) else { continue }
-                guard seen.insert(normalized).inserted else { continue }
-                setCodes.append(normalized)
-                if setCodes.count == 4 {
-                    return setCodes
-                }
+            let extraction = parseSetCodeCandidates(
+                from: field.text,
+                allowLanguageInterveningTokens: true,
+                seen: &seen,
+                maxCount: 4
+            )
+            if extraction.hasSuspiciousSetCodes {
+                hasSuspiciousSetCodes = true
+            }
+            setCodes.append(contentsOf: extraction.setCodes)
+            if setCodes.count == 4 {
+                return (Array(setCodes.prefix(4)), hasSuspiciousSetCodes)
             }
         }
 
         if !setCodes.isEmpty {
-            return setCodes
+            return (Array(setCodes.prefix(4)), hasSuspiciousSetCodes)
         }
 
         let fallbackFields = fields
@@ -225,36 +245,147 @@ struct ScanQueryBuilder {
             .filter { $0.region == .fullCardFallback }
 
         for field in fallbackFields {
-            let tokens = tokensNearCollectorNumber(in: field.text)
-            for token in tokens {
-                let normalized = normalizeAlphaNumeric(token).uppercased()
-                guard normalized.count >= 2, normalized.count <= 5 else { continue }
-                guard !languageTokens.contains(normalized) else { continue }
-                guard !setCodeStopWords.contains(normalized) else { continue }
-                guard !isNumberLike(normalized) else { continue }
-                guard !noisyBodyKeywords.contains(normalized.lowercased()) else { continue }
-                guard !isRarityToken(normalized.lowercased()) else { continue }
-                guard looksLikeSetCode(normalized) else { continue }
-                guard seen.insert(normalized).inserted else { continue }
-                setCodes.append(normalized)
-                if setCodes.count == 4 {
-                    return setCodes
-                }
+            let extraction = parseSetCodeCandidates(
+                from: field.text,
+                allowLanguageInterveningTokens: true,
+                seen: &seen,
+                maxCount: 4 - setCodes.count
+            )
+            if extraction.hasSuspiciousSetCodes {
+                hasSuspiciousSetCodes = true
+            }
+            setCodes.append(contentsOf: extraction.setCodes)
+            if setCodes.count == 4 {
+                break
             }
         }
 
-        return setCodes
+        return (Array(setCodes.prefix(4)), hasSuspiciousSetCodes)
     }
 
-    private func tokensNearCollectorNumber(in text: String) -> [String] {
+    private func parseSetCodeCandidates(
+        from text: String,
+        allowLanguageInterveningTokens: Bool,
+        seen: inout Set<String>,
+        maxCount: Int
+    ) -> (setCodes: [String], hasSuspiciousSetCodes: Bool) {
         let tokens = tokenize(text)
-        guard let collectorIndex = tokens.firstIndex(where: { isNumberLike($0) && $0.contains("/") }) else {
-            return []
+        guard let collectorIndex = collectorIndex(in: tokens), collectorIndex > 0 else {
+            return ([], false)
         }
 
-        let windowStart = max(0, collectorIndex - 3)
-        let collectorWindow = tokens[windowStart ..< collectorIndex]
-        return Array(collectorWindow)
+        var setCodes: [String] = []
+        var hasSuspiciousSetCodes = false
+        var examinedCandidateCount = 0
+
+        for index in stride(from: collectorIndex - 1, through: 0, by: -1) {
+            if examinedCandidateCount >= 1 {
+                break
+            }
+
+            let token = tokens[index]
+            let normalized = normalizeAlphaNumeric(token).uppercased()
+            guard !normalized.isEmpty else { continue }
+
+            if isLanguageToken(normalized) && allowLanguageInterveningTokens {
+                continue
+            }
+
+            examinedCandidateCount += 1
+
+            let rawToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+            if isSetCodeCandidate(
+                rawToken: rawToken,
+                normalizedToken: normalized,
+                seen: &seen,
+                setCodes: &setCodes
+            ) {
+                if setCodes.count == maxCount {
+                    break
+                }
+                continue
+            }
+
+            if isPotentialSetCodeNoise(rawToken: rawToken, normalizedToken: normalized) {
+                hasSuspiciousSetCodes = true
+            }
+        }
+
+        return (setCodes, hasSuspiciousSetCodes)
+    }
+
+    private func collectorIndex(in tokens: [String]) -> Int? {
+        tokens.firstIndex(where: { isNumberLike($0) && $0.contains("/") })
+    }
+
+    private func isLanguageToken(_ token: String) -> Bool {
+        languageTokens.contains(token) || token == token.uppercased() && token.count == 2 && token.allSatisfy(\.isLetter) && (
+            token == "DE" || token == "EN"
+        )
+    }
+
+    private func isSetCodeCandidate(
+        rawToken: String,
+        normalizedToken: String,
+        seen: inout Set<String>,
+        setCodes: inout [String]
+    ) -> Bool {
+        guard isPotentialSetCodeCandidate(rawToken: rawToken, normalizedToken: normalizedToken) else {
+            return false
+        }
+        guard normalizedToken.count >= 2, normalizedToken.count <= 4 else {
+            return false
+        }
+        guard !languageTokens.contains(normalizedToken) else {
+            return false
+        }
+        guard !setCodeStopWords.contains(normalizedToken) else {
+            return false
+        }
+        guard !isNumberLike(normalizedToken) else {
+            return false
+        }
+        guard !noisyBodyKeywords.contains(normalizedToken.lowercased()) else {
+            return false
+        }
+        guard !isRarityToken(normalizedToken.lowercased()) else {
+            return false
+        }
+        guard looksLikeSetCode(normalizedToken) else {
+            return false
+        }
+        guard seen.insert(normalizedToken).inserted else {
+            return false
+        }
+
+        setCodes.append(normalizedToken)
+        return true
+    }
+
+    private func isPotentialSetCodeCandidate(rawToken: String, normalizedToken: String) -> Bool {
+        guard normalizedToken == rawToken.uppercased() else {
+            return false
+        }
+        guard normalizedToken.range(of: "^[A-Z0-9]+$", options: .regularExpression) != nil else {
+            return false
+        }
+        return true
+    }
+
+    private func isPotentialSetCodeNoise(rawToken: String, normalizedToken: String) -> Bool {
+        guard isPotentialSetCodeCandidate(rawToken: rawToken, normalizedToken: normalizedToken) else {
+            return false
+        }
+        guard normalizedToken.count >= 2, normalizedToken.count <= 4 else {
+            return false
+        }
+        guard !isRarityToken(normalizedToken.lowercased()) else {
+            return false
+        }
+        guard !languageTokens.contains(normalizedToken) else {
+            return false
+        }
+        return true
     }
 
     private func rarityCandidates(from fields: [RecognizedCardField]) -> [String] {
@@ -424,22 +555,14 @@ struct ScanQueryBuilder {
         }
 
         if normalized.range(of: "^[A-Z0-9]{1,4}/[A-Z0-9]{1,4}$", options: .regularExpression) != nil {
-            return normalized.contains(where: \Character.isNumber)
+            return true
         }
 
         return false
     }
 
     private func looksLikeSetCode(_ token: String) -> Bool {
-        guard token.rangeOfCharacter(from: .letters) != nil else {
-            return false
-        }
-
-        if token.range(of: "^[A-Z]{2,5}[0-9]{0,2}$", options: .regularExpression) != nil {
-            return true
-        }
-
-        if token.range(of: "^[A-Z]{1,2}[0-9]{2,3}$", options: .regularExpression) != nil {
+        if token.range(of: "^(?=.*[A-Z])[A-Z0-9]{2,4}$", options: .regularExpression) != nil {
             return true
         }
 
@@ -464,7 +587,49 @@ struct ScanQueryBuilder {
         return noisyTokenCount >= 2
     }
 
-    private func looksLikeNameField(_ text: String) -> Bool {
+    private func evaluateNameSignal(for field: RecognizedCardField) -> NameSignalStrength? {
+        guard isLikelyNameField(field.text) else {
+            return nil
+        }
+
+        let tokens = tokenizeName(field.text)
+        guard !tokens.isEmpty else {
+            return nil
+        }
+
+        guard tokens.count <= 4 else {
+            return nil
+        }
+
+        guard tokens.contains(where: { $0.rangeOfCharacter(from: .letters) != nil }) else {
+            return nil
+        }
+
+        if tokens.count == 1, let token = tokens.first {
+            let digitCount = token.filter(\.isNumber).count
+            if token.first?.isNumber == true || digitCount >= 2 {
+                return nil
+            }
+
+            guard token.count <= 3 else {
+                return field.boundingBox.width >= 0.16 ? .strong : nil
+            }
+
+            if field.boundingBox.width >= 0.22 && field.confidence >= 0.85 {
+                return .strong
+            }
+
+            return .weak
+        }
+
+        if field.boundingBox.width < 0.16 {
+            return nil
+        }
+
+        return .strong
+    }
+
+    private func isLikelyNameField(_ text: String) -> Bool {
         let lowercasedText = text.lowercased()
         if lowercasedText.contains("entwickelt sich aus") || lowercasedText.contains("evolves from") {
             return false
@@ -476,10 +641,6 @@ struct ScanQueryBuilder {
 
         let tokens = tokenizeName(text)
         guard !tokens.isEmpty else {
-            return false
-        }
-
-        guard tokens.count <= 4 else {
             return false
         }
 
@@ -523,7 +684,7 @@ struct ScanQueryBuilder {
     }
 
     private func looksLikeFallbackNameField(_ text: String) -> Bool {
-        guard looksLikeNameField(text) else {
+        guard isLikelyNameField(text) else {
             return false
         }
 

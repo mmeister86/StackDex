@@ -88,6 +88,31 @@ import Testing
         #expect(hints.normalizedQuery.isEmpty)
     }
 
+    @Test func weakTitleNameDoesNotProduceNameQueryAndKeepsNumberCenteredForLikelyOCRGlitch() {
+        let hints = builder.buildHints(from: [
+            .init(text: "Lor", confidence: 0.96, region: .titleStrip, boundingBox: CGRect(x: 0.12, y: 0.06, width: 0.19, height: 0.08)),
+            .init(text: "ZUGES 081/088 BORA", confidence: 0.82, region: .collectorFooter, boundingBox: CGRect(x: 0.06, y: 0.85, width: 0.65, height: 0.09)),
+        ])
+
+        #expect(hints.nameTokens.isEmpty)
+        #expect(hints.normalizedQuery == "081/088")
+        #expect(hints.possibleSetCodes.isEmpty)
+        #expect(hints.possibleNumbers == ["081/088"])
+        #expect(hints.signalQuality.isWeakNameSignal)
+        #expect(!hints.signalQuality.hasSuspiciousSetCodes)
+        #expect(hints.signalQuality.hasCollectorNumberSignal)
+    }
+
+    @Test func setCodeParserRejectsNaturalWordsNearCollectorNumber() {
+        let hints = builder.buildHints(from: [
+            .init(text: "VIELE BORA 081/088", confidence: 0.99, region: .collectorFooter, boundingBox: CGRect(x: 0.06, y: 0.83, width: 0.62, height: 0.09)),
+        ])
+
+        #expect(hints.possibleSetCodes.isEmpty)
+        #expect(hints.possibleNumbers == ["081/088"])
+        #expect(hints.signalQuality.hasSuspiciousSetCodes)
+    }
+
     @Test func evolutionSentenceInNameBandIsIgnoredInFavorOfCardName() {
         let hints = builder.buildHints(from: [
             .init(text: "Entwickelt sich aus Alpollo", confidence: 0.99, region: .evolutionLine, boundingBox: CGRect(x: 0.1, y: 0.1, width: 0.8, height: 0.08)),

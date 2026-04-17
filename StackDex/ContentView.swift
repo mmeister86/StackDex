@@ -11,10 +11,12 @@ struct ContentView: View {
     enum RootTab: Hashable {
         case collection
         case scan
+        case ocrDebug
         case settings
     }
 
     @State private var selectedTab: RootTab = .collection
+    @State private var ocrDebugSnapshot: ScanOCRDebugSnapshot?
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -24,11 +26,19 @@ struct ContentView: View {
                 }
                 .tag(RootTab.collection)
 
-            ScanTabView()
+            ScanTabView { snapshot in
+                ocrDebugSnapshot = snapshot
+            }
                 .tabItem {
                     Label("Scannen", systemImage: "camera.viewfinder")
                 }
                 .tag(RootTab.scan)
+
+            ScanOCRDebugTabView(snapshot: ocrDebugSnapshot)
+                .tabItem {
+                    Label("OCR Debug", systemImage: "text.viewfinder")
+                }
+                .tag(RootTab.ocrDebug)
 
             SettingsTabView()
                 .tabItem {

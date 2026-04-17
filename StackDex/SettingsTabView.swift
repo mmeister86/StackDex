@@ -14,17 +14,28 @@ struct SettingsTabView: View {
     @State private var renameDescription: String = ""
 
     @State private var collectionToDelete: CollectionEntity?
+    #if DEBUG
+    @State private var selectedOCRQualityPreset: ScanOCRQualityPreset = .maximum
+    @State private var selectedOCRPostProcessMode: ScanOCRPostProcessMode = .visionOnly
+    #endif
 
     var body: some View {
         NavigationStack {
             Form {
                 createCollectionSection
                 pinnedCollectionSection
+                #if DEBUG
+                scannerDebugSection
+                #endif
                 existingCollectionsSection
             }
             .navigationTitle("Einstellungen")
             .onAppear {
                 pinnedCollectionID = AppStateAccess.primary(in: modelContext).pinnedDefaultCollectionID
+                #if DEBUG
+                selectedOCRQualityPreset = AppStateAccess.scanOCRQualityPreset(in: modelContext)
+                selectedOCRPostProcessMode = AppStateAccess.scanOCRPostProcessMode(in: modelContext)
+                #endif
             }
             .onChange(of: collections.map(\.id)) { _, _ in
                 pinnedCollectionID = AppStateAccess.primary(in: modelContext).pinnedDefaultCollectionID
@@ -54,6 +65,32 @@ struct SettingsTabView: View {
             }
         }
     }
+
+    #if DEBUG
+    private var scannerDebugSection: some View {
+        Section("Scanner (Debug)") {
+            Picker("OCR-Modus", selection: $selectedOCRQualityPreset) {
+                ForEach(ScanOCRQualityPreset.allCases, id: \.self) { preset in
+                    Text(preset.rawValue).tag(preset)
+                }
+            }
+            .accessibilityIdentifier("settings.scanner.ocrQuality")
+            .onChange(of: selectedOCRQualityPreset) { _, newValue in
+                AppStateAccess.setScanOCRQualityPreset(newValue, in: modelContext)
+            }
+
+            Picker("Postbearbeitung", selection: $selectedOCRPostProcessMode) {
+                ForEach(ScanOCRPostProcessMode.allCases, id: \.self) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .accessibilityIdentifier("settings.scanner.postProcess")
+            .onChange(of: selectedOCRPostProcessMode) { _, newValue in
+                AppStateAccess.setScanOCRPostProcessMode(newValue, in: modelContext)
+            }
+        }
+    }
+    #endif
 
     private var collections: [CollectionEntity] {
         allCollections.sorted {

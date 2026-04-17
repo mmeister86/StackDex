@@ -103,6 +103,38 @@ struct VisionScanPipelineServiceTests {
         #expect(!loweredNameTokens.contains("gespeicherte"))
         #expect(!result.hints.normalizedQuery.lowercased().contains("gespeicherte"))
     }
+
+    @Test func rawObservationsAreCapturedForDebugOutput() async throws {
+        let image = TestCardImageFactory.makeCardImage(name: "Pikachu ex", collectorNumber: "199/091")
+
+        let result = try await service.process(input: .captured(image), settings: .default)
+
+        #expect(!result.rawObservations.isEmpty)
+        #expect(result.rawObservations.contains(where: { !$0.candidates.isEmpty }))
+    }
+
+    @Test func rawObservationsContainMultipleCandidatesForAtLeastOneObservation() async throws {
+        let image = TestCardImageFactory.makeCardImage(name: "Pikachu ex", collectorNumber: "199/091")
+
+        let result = try await service.process(input: .captured(image), settings: .default)
+
+        #expect(result.rawObservations.contains(where: { $0.candidates.count > 1 }))
+    }
+
+    @Test func topCandidateFullTextContainsDetectedNameAndNumber() async throws {
+        let image = TestCardImageFactory.makeCardImage(name: "Pikachu ex", collectorNumber: "199/091")
+
+        let result = try await service.process(input: .captured(image), settings: .default)
+        let snapshot = ScanOCRDebugSnapshot(
+            updatedAt: .now,
+            source: result.source,
+            rawObservations: result.rawObservations
+        )
+        let fullText = snapshot.fullRecognizedText.lowercased()
+
+        #expect(fullText.contains("pikachu"))
+        #expect(fullText.contains("199/091"))
+    }
 }
 
 private enum TestCardImageFactory {

@@ -8,6 +8,14 @@ import {
 } from "./lib/cardsLookupContract";
 import type { PokewalletLookupArgs } from "./lib/pokewalletTypes";
 
+const signalQualityValidator = v.optional(
+  v.object({
+    isWeakNameSignal: v.optional(v.boolean()),
+    hasCollectorNumberSignal: v.optional(v.boolean()),
+    hasSuspiciousSetCodes: v.optional(v.boolean()),
+  }),
+);
+
 const hintsValidator = v.optional(
   v.object({
     normalizedQuery: v.optional(v.string()),
@@ -16,6 +24,7 @@ const hintsValidator = v.optional(
     possibleSetCodes: v.optional(v.array(v.string())),
     possibleRarities: v.optional(v.array(v.string())),
     possibleLanguages: v.optional(v.array(v.string())),
+    signalQuality: signalQualityValidator,
   }),
 );
 
@@ -39,8 +48,62 @@ export type LookupArgs = {
     possibleSetCodes?: string[];
     possibleRarities?: string[];
     possibleLanguages?: string[];
+    signalQuality?: {
+      isWeakNameSignal?: boolean;
+      hasCollectorNumberSignal?: boolean;
+      hasSuspiciousSetCodes?: boolean;
+    };
   };
 };
+
+function shouldApplyNumberGuard(args: LookupArgs): boolean {
+  return !!(
+    args.hints?.signalQuality?.isWeakNameSignal &&
+    args.hints?.signalQuality?.hasCollectorNumberSignal
+  );
+}
+
+function normalizeCollectorNumber(raw: string): string {
+  const split = raw
+    .trim()
+    .toUpperCase()
+    .split("/")
+    .at(0);
+
+  if (!split) {
+    return "";
+  }
+
+  return split.replace(/^0+(?=\d)/g, "");
+}
+
+function extractTargetCollectorNumber(args: LookupArgs): string | null {
+  const numberHint = args.hints?.possibleNumbers?.find((entry) => entry.includes("/"));
+  if (!numberHint) {
+    return null;
+  }
+  return normalizeCollectorNumber(numberHint);
+}
+
+function normalizeCandidateNumber(raw: string | undefined | null): string | null {
+  if (!raw) {
+    return null;
+  }
+  return normalizeCollectorNumber(raw);
+}
+
+function applyNumberGuard(candidates: CardCandidate[], args: LookupArgs): CardCandidate[] {
+  if (!shouldApplyNumberGuard(args)) {
+    return candidates;
+  }
+
+  const targetNumber = extractTargetCollectorNumber(args);
+  if (!targetNumber) {
+    return candidates;
+  }
+
+  return candidates.filter((candidate) => normalizeCandidateNumber(candidate.number) === targetNumber);
+}
 
 export async function lookupHandler(
   deps: {
@@ -59,7 +122,7 @@ export async function lookupHandler(
   };
 
   try {
-    const primaryCandidates = await deps.fetchPrimaryCards(lookupArgs);
+    const primaryCandidates = applyNumberGuard(await deps.fetchPrimaryCards(lookupArgs), args);
     if (primaryCandidates.length > 0) {
       return buildCardsLookupEnvelope(primaryCandidates);
     }
@@ -67,7 +130,7 @@ export async function lookupHandler(
     // Intentionally ignored so we can fall back to the secondary provider.
   }
 
-  const fallbackCandidates = await deps.fetchFallbackCards(lookupArgs);
+  const fallbackCandidates = applyNumberGuard(await deps.fetchFallbackCards(lookupArgs), args);
 
   return buildCardsLookupEnvelope(fallbackCandidates);
 }

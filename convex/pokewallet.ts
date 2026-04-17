@@ -15,6 +15,13 @@ const hintsValidator = v.optional(
     possibleSetCodes: v.optional(v.array(v.string())),
     possibleRarities: v.optional(v.array(v.string())),
     possibleLanguages: v.optional(v.array(v.string())),
+    signalQuality: v.optional(
+      v.object({
+        isWeakNameSignal: v.optional(v.boolean()),
+        hasCollectorNumberSignal: v.optional(v.boolean()),
+        hasSuspiciousSetCodes: v.optional(v.boolean()),
+      }),
+    ),
   }),
 );
 

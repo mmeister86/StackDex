@@ -9,6 +9,11 @@ export type PokewalletLookupArgs = {
     possibleSetCodes?: string[];
     possibleRarities?: string[];
     possibleLanguages?: string[];
+    signalQuality?: {
+      isWeakNameSignal?: boolean;
+      hasCollectorNumberSignal?: boolean;
+      hasSuspiciousSetCodes?: boolean;
+    };
   };
 };
 

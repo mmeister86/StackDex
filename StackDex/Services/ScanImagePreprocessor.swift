@@ -2,7 +2,7 @@ import CoreImage
 import ImageIO
 import UIKit
 
-enum ScanImageSource {
+enum ScanImageSource: Equatable {
     case captured
     case imported
 }

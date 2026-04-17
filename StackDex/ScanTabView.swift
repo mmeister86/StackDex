@@ -15,6 +15,7 @@ struct ScanTabView: View {
     @State private var isProcessing = false
     @State private var scanOutcome = ScanResultPolicy.Outcome(state: .noMatch, candidates: [])
     @State private var lastHints = ScanLookupHints(normalizedQuery: "", nameTokens: [], possibleNumbers: [])
+    @State private var lastCandidateValidation = ScanCandidateValidationPolicy.Result.empty
     @State private var lastLookupAttempts: [ScanLookupAttempt] = []
     @State private var lastPipelineResult: ScanPipelineResult?
     @State private var selectedCandidateID: String?
@@ -32,15 +33,18 @@ struct ScanTabView: View {
     private let lookupService: any CardLookupServing
     private let scanLookupService: any ScanLookupServing
     private let scanPipeline: any ScanPipelineServing
+    private let onOCRDebugSnapshotUpdate: (ScanOCRDebugSnapshot) -> Void
     private let logger = Logger(subsystem: "de.stackdex.app", category: "scan.ui")
 
     init(
         lookupService: any CardLookupServing = CardLookupServiceFactory.makeDefault(),
-        scanPipeline: any ScanPipelineServing = VisionScanPipelineService()
+        scanPipeline: any ScanPipelineServing = VisionScanPipelineService(),
+        onOCRDebugSnapshotUpdate: @escaping (ScanOCRDebugSnapshot) -> Void = { _ in }
     ) {
         self.lookupService = lookupService
         self.scanLookupService = ProgressiveScanLookupService(base: lookupService)
         self.scanPipeline = scanPipeline
+        self.onOCRDebugSnapshotUpdate = onOCRDebugSnapshotUpdate
     }
 
     var body: some View {
@@ -459,7 +463,7 @@ struct ScanTabView: View {
 
             #if DEBUG
             if let lastPipelineResult {
-                debugPanel(for: lastPipelineResult, attempts: lastLookupAttempts)
+                debugPanel(for: lastPipelineResult, attempts: lastLookupAttempts, validation: lastCandidateValidation)
             }
             #endif
         }
@@ -636,9 +640,25 @@ struct ScanTabView: View {
         lastPipelineResult = nil
 
         do {
-            let pipelineResult = try await scanPipeline.process(input: input, settings: .default)
+            let qualityPreset = AppStateAccess.scanOCRQualityPreset(in: modelContext)
+            let postProcessMode = AppStateAccess.scanOCRPostProcessMode(in: modelContext)
+            var pipelineSettings = qualityPreset.settings
+            pipelineSettings.postProcessMode = postProcessMode
+
+            let pipelineResult = try await scanPipeline.process(
+                input: input,
+                settings: pipelineSettings
+            )
             lastPipelineResult = pipelineResult
+            onOCRDebugSnapshotUpdate(
+                ScanOCRDebugSnapshot(
+                    updatedAt: .now,
+                    source: pipelineResult.source,
+                    rawObservations: pipelineResult.rawObservations
+                )
+            )
             lastHints = pipelineResult.hints
+            lastCandidateValidation = .empty
 
             if pipelineResult.usedFullImageFallback {
                 appendInfoMessage("Kartenrahmen nicht sicher erkannt. Vollbild-Fallback wurde verwendet.")
@@ -676,9 +696,19 @@ struct ScanTabView: View {
                 )
             )
             lastLookupAttempts = lookupResponse.attempts
+            let validation = ScanCandidateValidationPolicy.validate(
+                candidates: lookupResponse.candidates,
+                hints: pipelineResult.hints
+            )
+            lastCandidateValidation = validation
 
-            let outcome = ScanResultPolicy.evaluate(candidates: lookupResponse.candidates, maxCandidates: 3)
-            applyLookupOutcome(outcome, hints: pipelineResult.hints, lookupResponse: lookupResponse)
+            let outcome = ScanResultPolicy.evaluate(candidates: validation.candidates, maxCandidates: 3)
+            applyLookupOutcome(
+                outcome,
+                hints: pipelineResult.hints,
+                lookupResponse: lookupResponse,
+                validation: validation
+            )
         } catch {
             logger.error("Scan recognition failed: \(error.localizedDescription, privacy: .public)")
             errorMessage = "Erkennung fehlgeschlagen. Bitte erneut versuchen."
@@ -707,6 +737,8 @@ struct ScanTabView: View {
         let candidates = await lookupService.lookupCandidates(
             for: CardLookupRequest(recognizedTexts: [query], query: query, hints: hints, maxResults: 3)
         )
+        let validation = ScanCandidateValidationPolicy.validate(candidates: candidates, hints: hints)
+        lastCandidateValidation = validation
         lastLookupAttempts = [
             ScanLookupAttempt(
                 strategy: .structuredNameOnly,
@@ -714,15 +746,21 @@ struct ScanTabView: View {
                 candidateCount: candidates.count
             ),
         ]
-        let outcome = ScanResultPolicy.evaluate(candidates: candidates, maxCandidates: 3)
-        applyLookupOutcome(outcome, hints: hints, lookupResponse: nil)
+        let outcome = ScanResultPolicy.evaluate(candidates: validation.candidates, maxCandidates: 3)
+        applyLookupOutcome(
+            outcome,
+            hints: hints,
+            lookupResponse: nil,
+            validation: validation
+        )
         isProcessing = false
     }
 
     private func applyLookupOutcome(
         _ outcome: ScanResultPolicy.Outcome,
         hints: ScanLookupHints,
-        lookupResponse: ScanLookupResponse?
+        lookupResponse: ScanLookupResponse?,
+        validation: ScanCandidateValidationPolicy.Result
     ) {
         scanOutcome = outcome
         selectedCandidateID = outcome.candidates.first?.id
@@ -733,9 +771,12 @@ struct ScanTabView: View {
             selectedResultSheetDetent = .medium
         }
 
-        if case .manualSearch(let prefilledQuery) = ScanFlowRoutingPolicy.nextStep(outcome: outcome, hints: hints), !prefilledQuery.isEmpty {
-            manualSearchQuery = prefilledQuery
-            appendInfoMessage("Manuelle Suche wurde mit Hinweisen vorbelegt.")
+        if case .manualSearch(let prefilledQuery) = ScanFlowRoutingPolicy.nextStep(outcome: outcome, hints: hints) {
+            let query = validation.numberGuardApplied ? (validation.comparedNumber ?? prefilledQuery) : prefilledQuery
+            if !query.isEmpty {
+                manualSearchQuery = query
+                appendInfoMessage("Manuelle Suche wurde mit Hinweisen vorbelegt.")
+            }
         }
 
         if outcome.state == .noMatch {
@@ -945,11 +986,17 @@ struct ScanTabView: View {
 
     #if DEBUG
     @ViewBuilder
-    private func debugPanel(for result: ScanPipelineResult, attempts: [ScanLookupAttempt]) -> some View {
+    private func debugPanel(for result: ScanPipelineResult, attempts: [ScanLookupAttempt], validation: ScanCandidateValidationPolicy.Result) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Debug")
                 .font(.caption.weight(.semibold))
             Text("Query: \(result.hints.normalizedQuery.isEmpty ? "-" : result.hints.normalizedQuery)")
+                .font(.caption2)
+            Text("SignalQuality: weakName=\(result.hints.signalQuality.isWeakNameSignal ? "true" : "false"), collectorNumber=\(result.hints.signalQuality.hasCollectorNumberSignal ? "true" : "false"), suspiciousSetCode=\(result.hints.signalQuality.hasSuspiciousSetCodes ? "true" : "false")")
+                .font(.caption2)
+            Text("NumberGuard: applied=\(validation.numberGuardApplied ? "true" : "false"), filteredCount=\(validation.numberGuardFilteredCount)")
+                .font(.caption2)
+            Text("Compared number: \(validation.comparedNumber ?? "-")")
                 .font(.caption2)
             Text("Set-Codes: \(result.hints.possibleSetCodes.isEmpty ? "-" : result.hints.possibleSetCodes.joined(separator: ", "))")
                 .font(.caption2)
